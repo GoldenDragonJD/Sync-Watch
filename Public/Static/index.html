@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>SyncStream - Watch Together</title>
+        <link rel="stylesheet" href="/style" />
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+        <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+    </head>
+    <body>
+        <header class="app-header">
+            <h1 class="logo">Sync<span>Stream</span></h1>
+        </header>
+
+        <main id="app-container">
+            <section id="search-view" class="view active">
+                <div class="search-container">
+                    <h2>What do you want to watch?</h2>
+                    <form id="search-form">
+                        <input
+                            type="text"
+                            id="search-input"
+                            placeholder="Search for anime (e.g., Dr. Stone)..."
+                            required
+                            autocomplete="off"
+                        />
+                        <button type="submit" id="search-btn">Search</button>
+                    </form>
+                </div>
+
+                <div id="loading-spinner" class="hidden">
+                    Searching the archives...
+                </div>
+
+                <div id="results-grid" class="grid"></div>
+            </section>
+
+            <section id="watch-view" class="view hidden">
+                <div class="player-header">
+                    <button id="back-btn" class="secondary-btn">
+                        ← Back to Search
+                    </button>
+                    <h2 id="current-show-title">Show Title</h2>
+                </div>
+
+                <div class="layout-wrapper">
+                    <div class="video-container">
+                        <video
+                            id="video-player"
+                            controls
+                            preload="auto"
+                        ></video>
+                        <div id="video-loading-overlay" class="hidden">
+                            Buffering Stream...
+                        </div>
+                    </div>
+
+                    <div class="episode-sidebar">
+                        <h3>Episodes</h3>
+                        <div class="episode-controls">
+                            <select id="dub-sub-toggle">
+                                <option value="sub">Sub</option>
+                                <option value="dub">Dub</option>
+                            </select>
+                        </div>
+                        <div id="episode-grid" class="ep-grid"></div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <script src="/logic"></script>
+    </body>
+</html>
