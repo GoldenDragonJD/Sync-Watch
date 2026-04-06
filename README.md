@@ -7,3 +7,4 @@ Using it is very simple and easy, simply look up the anime using it's name and p
 Since it's meant for private occations away from the public internet, syncing happens as soon as one connects, after that all actions are now synced, from searching to playing and pausing.
 
 ## THANK YOU [ani-cli](https://github.com/pystardust/ani-cli/tree/master)
+This project would not have been as easy without the hardwork of the developers of this software.
