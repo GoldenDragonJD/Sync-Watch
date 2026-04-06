@@ -19,12 +19,28 @@ let currentShowName = "";
 let currentHlsInstance = null;
 let currentEpNum = null;
 
+// --- NEW DOM Element ---
+const syncToggle = document.getElementById("sync-toggle");
+
+// --- NEW Global Sync State (Defaults to false/off) ---
+// We check localStorage. If it's explicitly "true", we turn it on.
+let isSyncEnabled = localStorage.getItem("syncEnabled") === "true";
+syncToggle.checked = isSyncEnabled;
+
+// Listen for the user clicking the switch
+syncToggle.addEventListener("change", (e) => {
+  isSyncEnabled = e.target.checked;
+  localStorage.setItem("syncEnabled", isSyncEnabled);
+});
+
 // --- Event Listeners ---
 searchForm.addEventListener("submit", handleSearch);
 backBtn.addEventListener("click", () => {
   updateURL("");
   showSearchView();
-  socket.emit("back_action"); // Tell the friend's browser to go back too!
+  if (isSyncEnabled) {
+    socket.emit("back_action"); // Tell the friend's browser to go back too!
+  }
 });
 
 modeToggle.addEventListener("change", () => {
@@ -90,7 +106,9 @@ async function handleSearch(e) {
   const query = searchInput.value.trim();
   if (!query) return;
 
-  socket.emit("search_action", { query: query });
+  if (isSyncEnabled) {
+    socket.emit("search_action", { query: query });
+  }
 
   resultsGrid.innerHTML = "";
   loadingSpinner.classList.remove("hidden");
@@ -137,7 +155,9 @@ async function loadEpisodes(
 ) {
   // 1. If YOU clicked this, tell your friend's browser to do it too
   if (!isRemote) {
-    socket.emit("load_show_action", { showId, showName, targetEpNum });
+    if (isSyncEnabled) {
+      socket.emit("load_show_action", { showId, showName, targetEpNum });
+    }
   }
 
   currentShowId = showId;
@@ -198,7 +218,9 @@ function renderEpisodeButtons(episodes, activeEpNum) {
 async function playVideo(epNum, isRemote = false) {
   // 1. If YOU clicked the episode button, broadcast it
   if (!isRemote) {
-    socket.emit("load_episode_action", { epNum });
+    if (isSyncEnabled) {
+      socket.emit("load_episode_action", { epNum });
+    }
   }
 
   currentEpNum = epNum;
@@ -323,7 +345,9 @@ socket.on("receive_search", async (data) => {
 // 2. Sending / Receiving Video Play
 videoPlayer.addEventListener("play", () => {
   if (!isRemoteAction) {
-    socket.emit("play_action", { time: videoPlayer.currentTime });
+    if (isSyncEnabled) {
+      socket.emit("play_action", { time: videoPlayer.currentTime });
+    }
   }
   isRemoteAction = false; // Reset the flag immediately after letting it pass
 });
@@ -358,6 +382,7 @@ socket.on("receive_load_episode", (data) => {
 
 // Receive a command to go back to the search page
 socket.on("receive_back", () => {
+  if (!isSyncEnabled) return;
   updateURL("");
   showSearchView();
 });
@@ -365,12 +390,15 @@ socket.on("receive_back", () => {
 // 3. Sending / Receiving Video Pause
 videoPlayer.addEventListener("pause", () => {
   if (!isRemoteAction) {
-    socket.emit("pause_action", { time: videoPlayer.currentTime });
+    if (isSyncEnabled) {
+      socket.emit("pause_action", { time: videoPlayer.currentTime });
+    }
   }
   isRemoteAction = false;
 });
 
 socket.on("receive_pause", (data) => {
+  if (!isSyncEnabled) return;
   isRemoteAction = true;
   videoPlayer.currentTime = data.time; // Lock to their exact pause frame
   videoPlayer.pause();
@@ -379,12 +407,15 @@ socket.on("receive_pause", (data) => {
 // 4. Sending / Receiving Video Seeking (Timeline scrubbing)
 videoPlayer.addEventListener("seeked", () => {
   if (!isRemoteAction) {
-    socket.emit("seek_action", { time: videoPlayer.currentTime });
+    if (isSyncEnabled) {
+      socket.emit("seek_action", { time: videoPlayer.currentTime });
+    }
   }
   isRemoteAction = false;
 });
 
 socket.on("receive_seek", (data) => {
+  if (!isSyncEnabled) return;
   isRemoteAction = true;
   videoPlayer.currentTime = data.time;
 });
