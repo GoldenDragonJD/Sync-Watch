@@ -361,6 +361,27 @@ def get_stream(show_id, episode_string):
         return jsonify({"error": "Failed to extract final video link."}), 500
 
 
+@app.route("/api/schedule")
+def get_schedule():
+    day = request.args.get("day")
+
+    # Jikan v4 schedule endpoint takes a 'filter' parameter for the day of the week
+    jikan_url = "https://api.jikan.moe/v4/schedules"
+
+    # If a day was provided, append it to the query
+    if day:
+        jikan_url += f"?filter={day.lower()}"
+
+    try:
+        response = requests.get(jikan_url)
+        if response.status_code == 200:
+            return jsonify(response.json())
+        else:
+            return jsonify({"error": "Failed to fetch schedule from Jikan"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @socketio.on("search_action")
 def handle_search_sync(data):
     # Broadcast the search query to everyone ELSE in the room

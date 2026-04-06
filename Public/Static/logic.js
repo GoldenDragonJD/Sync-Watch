@@ -5,6 +5,7 @@ const searchForm = document.getElementById("search-form");
 const searchInput = document.getElementById("search-input");
 const resultsGrid = document.getElementById("results-grid");
 const loadingSpinner = document.getElementById("loading-spinner");
+const scheduleContainer = document.getElementById("schedule-container"); // ADDED THIS
 
 const backBtn = document.getElementById("back-btn");
 const showTitleEl = document.getElementById("current-show-title");
@@ -19,15 +20,11 @@ let currentShowName = "";
 let currentHlsInstance = null;
 let currentEpNum = null;
 
-// --- NEW DOM Element ---
+// --- Sync Toggle State ---
 const syncToggle = document.getElementById("sync-toggle");
-
-// --- NEW Global Sync State (Defaults to false/off) ---
-// We check localStorage. If it's explicitly "true", we turn it on.
 let isSyncEnabled = localStorage.getItem("syncEnabled") === "true";
 syncToggle.checked = isSyncEnabled;
 
-// Listen for the user clicking the switch
 syncToggle.addEventListener("change", (e) => {
   isSyncEnabled = e.target.checked;
   localStorage.setItem("syncEnabled", isSyncEnabled);
@@ -35,11 +32,20 @@ syncToggle.addEventListener("change", (e) => {
 
 // --- Event Listeners ---
 searchForm.addEventListener("submit", handleSearch);
+
+// Bring schedule back if user deletes their search
+searchInput.addEventListener("input", (e) => {
+  if (e.target.value.trim() === "") {
+    if (scheduleContainer) scheduleContainer.classList.remove("hidden");
+    resultsGrid.innerHTML = "";
+  }
+});
+
 backBtn.addEventListener("click", () => {
   updateURL("");
   showSearchView();
   if (isSyncEnabled) {
-    socket.emit("back_action"); // Tell the friend's browser to go back too!
+    socket.emit("back_action");
   }
 });
 
@@ -48,9 +54,7 @@ modeToggle.addEventListener("change", () => {
 });
 
 videoPlayer.addEventListener("timeupdate", () => {
-  // Only save if we are actually watching something
   if (currentShowId && currentEpNum && videoPlayer.currentTime > 0) {
-    // Creates a unique save slot like: "save_JqWBkZQZwEjhLTDC2_1"
     localStorage.setItem(
       `save_${currentShowId}_${currentEpNum}`,
       videoPlayer.currentTime,
@@ -64,7 +68,6 @@ videoOverlay.addEventListener("click", () => {
 });
 
 // --- URL Routing & State Persistence ---
-// This runs immediately when the page loads or refreshes
 document.addEventListener("DOMContentLoaded", () => {
   const params = new URLSearchParams(window.location.search);
   const showId = params.get("show");
@@ -72,14 +75,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const showName = params.get("name") || "Anime";
 
   if (showId) {
-    // If the URL has data, immediately load the player!
     loadEpisodes(showId, showName, epNum);
   } else {
     showSearchView();
   }
 });
 
-// Silently updates the browser URL without refreshing the page
 function updateURL(showId, showName, epNum) {
   if (!showId) {
     window.history.pushState({}, "", "/");
@@ -89,7 +90,6 @@ function updateURL(showId, showName, epNum) {
   }
 }
 
-// Listen for the user clicking the "Back" button on their browser/phone
 window.addEventListener("popstate", () => {
   const params = new URLSearchParams(window.location.search);
   if (params.get("show")) {
@@ -100,7 +100,6 @@ window.addEventListener("popstate", () => {
 });
 
 // --- Core Functions ---
-
 async function handleSearch(e) {
   e.preventDefault();
   const query = searchInput.value.trim();
@@ -109,6 +108,9 @@ async function handleSearch(e) {
   if (isSyncEnabled) {
     socket.emit("search_action", { query: query });
   }
+
+  // Hide the schedule so it doesn't overlap the search results!
+  if (scheduleContainer) scheduleContainer.classList.add("hidden");
 
   resultsGrid.innerHTML = "";
   loadingSpinner.classList.remove("hidden");
@@ -138,9 +140,9 @@ function renderSearchResults(shows) {
       show.availableEpisodes?.sub || show.availableEpisodes?.dub || "?";
 
     card.innerHTML = `
-            <h3>${show.name}</h3>
-            <p>${totalEps} Episodes Available</p>
-        `;
+      <h3>${show.name}</h3>
+      <p>${totalEps} Episodes Available</p>
+    `;
 
     card.addEventListener("click", () => loadEpisodes(show._id, show.name, 1));
     resultsGrid.appendChild(card);
@@ -153,11 +155,8 @@ async function loadEpisodes(
   targetEpNum = 1,
   isRemote = false,
 ) {
-  // 1. If YOU clicked this, tell your friend's browser to do it too
-  if (!isRemote) {
-    if (isSyncEnabled) {
-      socket.emit("load_show_action", { showId, showName, targetEpNum });
-    }
+  if (!isRemote && isSyncEnabled) {
+    socket.emit("load_show_action", { showId, showName, targetEpNum });
   }
 
   currentShowId = showId;
@@ -178,8 +177,6 @@ async function loadEpisodes(
 
     renderEpisodeButtons(episodes, targetEpNum);
 
-    // Auto-play the target episode. Pass the isRemote flag down
-    // so it doesn't accidentally trigger a double-broadcast!
     if (
       episodes.includes(targetEpNum.toString()) ||
       episodes.includes(Number(targetEpNum))
@@ -216,11 +213,8 @@ function renderEpisodeButtons(episodes, activeEpNum) {
 }
 
 async function playVideo(epNum, isRemote = false) {
-  // 1. If YOU clicked the episode button, broadcast it
-  if (!isRemote) {
-    if (isSyncEnabled) {
-      socket.emit("load_episode_action", { epNum });
-    }
+  if (!isRemote && isSyncEnabled) {
+    socket.emit("load_episode_action", { epNum });
   }
 
   currentEpNum = epNum;
@@ -240,13 +234,11 @@ async function playVideo(epNum, isRemote = false) {
 
     const proxyUrl = `/proxy?url=${encodeURIComponent(data.stream_url)}`;
 
-    // Clean up old HLS instances so they don't fight with the new video
     if (currentHlsInstance) {
       currentHlsInstance.destroy();
       currentHlsInstance = null;
     }
 
-    // --- THE RESUME HELPER FIX ---
     const resumePlayback = () => {
       const savedTime = localStorage.getItem(`save_${currentShowId}_${epNum}`);
       if (savedTime) {
@@ -254,12 +246,8 @@ async function playVideo(epNum, isRemote = false) {
       }
       videoOverlay.classList.add("hidden");
 
-      // PREVENT THE ECHO LOOP: Tell the player this play command came from the code
-      if (isRemote) {
-        isRemoteAction = true;
-      }
+      if (isRemote) isRemoteAction = true;
 
-      // Catch Autoplay errors (Browsers sometimes block video if the user didn't click)
       const playPromise = videoPlayer.play();
       if (playPromise !== undefined) {
         playPromise.catch((error) => {
@@ -269,7 +257,6 @@ async function playVideo(epNum, isRemote = false) {
         });
       }
     };
-    // -----------------------------
 
     if (Hls.isSupported() && data.stream_url.includes(".m3u8")) {
       currentHlsInstance = new Hls({
@@ -294,9 +281,7 @@ async function playVideo(epNum, isRemote = false) {
       });
     } else {
       videoPlayer.src = proxyUrl;
-      // FIX THE STACKING BUG: Use onloadedmetadata instead of addEventListener
       videoPlayer.onloadedmetadata = resumePlayback;
-      // Force the browser to fetch the new video metadata
       videoPlayer.load();
     }
   } catch (err) {
@@ -311,6 +296,12 @@ function showSearchView() {
   videoPlayer.pause();
   videoPlayer.removeAttribute("src");
   videoPlayer.load();
+
+  // If the search bar is empty, bring the schedule back
+  if (searchInput.value.trim() === "") {
+    if (scheduleContainer) scheduleContainer.classList.remove("hidden");
+    resultsGrid.innerHTML = "";
+  }
 }
 
 function showWatchView() {
@@ -319,22 +310,23 @@ function showWatchView() {
 }
 
 // --- WebSocket Setup & Watch Party Logic ---
-const socket = io(); // Connects to your Flask-SocketIO server
-let isRemoteAction = false; // The crucial flag to prevent infinite echo loops
+const socket = io();
+let isRemoteAction = false;
 
-// 1. Sending / Receiving Search Sync
 socket.on("receive_search", async (data) => {
-  // A remote user searched! Update our input box and trigger the search
+  if (!isSyncEnabled) return; // Ignore if sync is off
   searchInput.value = data.query;
 
-  // We manually execute the search logic without triggering another socket emission
+  // Hide schedule visually
+  if (scheduleContainer) scheduleContainer.classList.add("hidden");
+
   resultsGrid.innerHTML = "";
   loadingSpinner.classList.remove("hidden");
   try {
     const res = await fetch(`/api/search/${encodeURIComponent(data.query)}`);
     const searchData = await res.json();
     renderSearchResults(searchData);
-    showSearchView(); // Force the screen back to search if they were watching a video
+    showSearchView();
   } catch (err) {
     console.error("Remote search failed", err);
   } finally {
@@ -342,20 +334,16 @@ socket.on("receive_search", async (data) => {
   }
 });
 
-// 2. Sending / Receiving Video Play
 videoPlayer.addEventListener("play", () => {
-  if (!isRemoteAction) {
-    if (isSyncEnabled) {
-      socket.emit("play_action", { time: videoPlayer.currentTime });
-    }
+  if (!isRemoteAction && isSyncEnabled) {
+    socket.emit("play_action", { time: videoPlayer.currentTime });
   }
-  isRemoteAction = false; // Reset the flag immediately after letting it pass
+  isRemoteAction = false;
 });
 
 socket.on("receive_play", (data) => {
-  isRemoteAction = true; // Tell the player "Don't echo this back!"
-
-  // If the time difference is greater than 1 second, snap to their time
+  if (!isSyncEnabled) return;
+  isRemoteAction = true;
   if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
     videoPlayer.currentTime = data.time;
   }
@@ -363,36 +351,28 @@ socket.on("receive_play", (data) => {
 });
 
 socket.on("receive_load_show", (data) => {
-  // Pass 'true' at the end so it knows this is a remote action
+  if (!isSyncEnabled) return;
   loadEpisodes(data.showId, data.showName, data.targetEpNum, true);
 });
 
-// Receive a command to swap episodes
 socket.on("receive_load_episode", (data) => {
-  // Visually update the episode buttons so the active one highlights
+  if (!isSyncEnabled) return;
   document.querySelectorAll(".ep-btn").forEach((b) => {
     b.classList.remove("active");
-    if (b.textContent == data.epNum) {
-      b.classList.add("active");
-    }
+    if (b.textContent == data.epNum) b.classList.add("active");
   });
-  // Play the video remotely
   playVideo(data.epNum, true);
 });
 
-// Receive a command to go back to the search page
 socket.on("receive_back", () => {
   if (!isSyncEnabled) return;
   updateURL("");
   showSearchView();
 });
 
-// 3. Sending / Receiving Video Pause
 videoPlayer.addEventListener("pause", () => {
-  if (!isRemoteAction) {
-    if (isSyncEnabled) {
-      socket.emit("pause_action", { time: videoPlayer.currentTime });
-    }
+  if (!isRemoteAction && isSyncEnabled) {
+    socket.emit("pause_action", { time: videoPlayer.currentTime });
   }
   isRemoteAction = false;
 });
@@ -400,16 +380,13 @@ videoPlayer.addEventListener("pause", () => {
 socket.on("receive_pause", (data) => {
   if (!isSyncEnabled) return;
   isRemoteAction = true;
-  videoPlayer.currentTime = data.time; // Lock to their exact pause frame
+  videoPlayer.currentTime = data.time;
   videoPlayer.pause();
 });
 
-// 4. Sending / Receiving Video Seeking (Timeline scrubbing)
 videoPlayer.addEventListener("seeked", () => {
-  if (!isRemoteAction) {
-    if (isSyncEnabled) {
-      socket.emit("seek_action", { time: videoPlayer.currentTime });
-    }
+  if (!isRemoteAction && isSyncEnabled) {
+    socket.emit("seek_action", { time: videoPlayer.currentTime });
   }
   isRemoteAction = false;
 });
@@ -419,3 +396,105 @@ socket.on("receive_seek", (data) => {
   isRemoteAction = true;
   videoPlayer.currentTime = data.time;
 });
+
+// --- Jikan Schedule Integration ---
+const scheduleGrid = document.getElementById("schedule-grid");
+const scheduleTitle = document.getElementById("schedule-title");
+const scheduleControls = document.getElementById("schedule-controls");
+
+const daysOfWeek = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
+
+document.addEventListener("DOMContentLoaded", () => {
+  buildDayFilters();
+});
+
+function buildDayFilters() {
+  scheduleControls.innerHTML = "";
+  const todayIndex = new Date().getDay();
+
+  daysOfWeek.forEach((day, index) => {
+    const btn = document.createElement("button");
+    btn.className = `ep-btn ${index === todayIndex ? "active" : ""}`;
+    btn.textContent = day.substring(0, 3);
+    btn.style.padding = "0.5rem 1rem";
+    btn.style.minWidth = "60px";
+
+    btn.addEventListener("click", () => {
+      document
+        .querySelectorAll("#schedule-controls .ep-btn")
+        .forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      fetchSchedule(day.toLowerCase(), `${day}'s Releases`);
+    });
+    scheduleControls.appendChild(btn);
+  });
+
+  const todayName = daysOfWeek[todayIndex];
+  fetchSchedule(todayName.toLowerCase(), `Today's Releases (${todayName})`);
+}
+
+async function fetchSchedule(dayName, titleLabel) {
+  scheduleTitle.textContent = "Loading...";
+  scheduleGrid.innerHTML = "";
+
+  try {
+    const res = await fetch(`/api/schedule?day=${dayName}`);
+    const json = await res.json();
+
+    if (json.data && json.data.length > 0) {
+      scheduleTitle.textContent = titleLabel;
+      renderSchedule(json.data);
+    } else {
+      scheduleTitle.textContent = titleLabel;
+      scheduleGrid.innerHTML = "<p>No releases found for this day.</p>";
+    }
+  } catch (err) {
+    console.error("Failed to load schedule", err);
+    scheduleTitle.textContent = "Error Loading Schedule";
+  }
+}
+
+function renderSchedule(animeList) {
+  scheduleGrid.innerHTML = "";
+
+  animeList.forEach((anime) => {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const imageUrl = anime.images?.jpg?.image_url || "";
+    const title = anime.title_english || anime.title || "Unknown Title";
+    const score = anime.score ? `★ ${anime.score}` : "Unrated";
+
+    card.innerHTML = `
+      <div style="display: flex; gap: 1rem; align-items: center;">
+          <img src="${imageUrl}" alt="${title}" style="width: 60px; height: 85px; border-radius: 8px; object-fit: cover;">
+          <div>
+              <h4 style="margin-bottom: 0.3rem; font-size: 1rem;">${title}</h4>
+              <p style="color: var(--primary); font-weight: bold; font-size: 0.9rem;">
+                  ${score}
+              </p>
+          </div>
+      </div>
+    `;
+
+    card.addEventListener("click", () => {
+      searchInput.value = title;
+      if (isSyncEnabled) {
+        socket.emit("search_action", { query: title });
+      }
+      searchForm.dispatchEvent(
+        new Event("submit", { cancelable: true, bubbles: true }),
+      );
+    });
+
+    scheduleGrid.appendChild(card);
+  });
+}

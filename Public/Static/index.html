@@ -6,7 +6,6 @@
         <title>SyncStream - Watch Together</title>
         <link rel="stylesheet" href="/style" />
         <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
     </head>
     <body>
@@ -36,6 +35,23 @@
                         />
                         <button type="submit" id="search-btn">Search</button>
                     </form>
+                </div>
+
+                <div id="schedule-container">
+                    <div class="schedule-header">
+                        <h3 id="schedule-title" style="color: var(--primary)">
+                            Loading Schedule...
+                        </h3>
+                        <div
+                            id="schedule-controls"
+                            class="schedule-controls"
+                        ></div>
+                    </div>
+                    <div
+                        id="schedule-grid"
+                        class="grid"
+                        style="margin-top: 1rem"
+                    ></div>
                 </div>
 
                 <div id="loading-spinner" class="hidden">
