@@ -42,6 +42,10 @@ videoPlayer.addEventListener("timeupdate", () => {
   }
 });
 
+videoOverlay.addEventListener("click", () => {
+  videoOverlay.classList.add("hidden");
+});
+
 // --- URL Routing & State Persistence ---
 // This runs immediately when the page loads or refreshes
 document.addEventListener("DOMContentLoaded", () => {
