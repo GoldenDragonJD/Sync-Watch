@@ -44,6 +44,7 @@ videoPlayer.addEventListener("timeupdate", () => {
 
 videoOverlay.addEventListener("click", () => {
   videoOverlay.classList.add("hidden");
+  videoPlayer.play();
 });
 
 // --- URL Routing & State Persistence ---
