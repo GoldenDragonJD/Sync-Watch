@@ -328,6 +328,64 @@ input:checked + .slider:before {
     border-radius: 4px;
 }
 
+.horizontal-scroll-container {
+    display: flex;
+    gap: 1rem;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 1rem;
+}
+
+.horizontal-scroll-container::-webkit-scrollbar {
+    height: 6px;
+}
+.horizontal-scroll-container::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 6px;
+}
+
+.history-card {
+    min-width: 220px;
+    max-width: 220px;
+    background-color: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem;
+    cursor: pointer;
+    transition:
+        transform 0.2s,
+        background-color 0.2s;
+    flex-shrink: 0; /* Prevents cards from squishing */
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+.history-card:hover {
+    transform: translateY(-3px);
+    background-color: var(--bg-card-hover);
+    border-color: var(--primary);
+}
+
+.history-card h4 {
+    font-size: 1rem;
+    margin-bottom: 0.5rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis; /* Adds '...' if the title is too long */
+}
+
+.history-card .ep-badge {
+    display: inline-block;
+    background-color: var(--primary);
+    color: white;
+    padding: 0.3rem 0.6rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: bold;
+    margin-top: 0.8rem;
+}
+
 /* =========================================
    Mobile Responsiveness
    ========================================= */

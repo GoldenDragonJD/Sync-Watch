@@ -498,3 +498,69 @@ function renderSchedule(animeList) {
     scheduleGrid.appendChild(card);
   });
 }
+
+const cwContainer = document.getElementById("continue-watching-container");
+const cwControls = document.getElementById("continue-watching-controls");
+
+// Updates the local storage array whenever you load a new episode
+function updateWatchHistory(showId, showName, epNum) {
+  let history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+
+  // Remove the show if it's already in the history (so we can move it to the front!)
+  history = history.filter((item) => item.id !== showId);
+
+  // Add the newly watched episode to the very beginning of the array
+  history.unshift({
+    id: showId,
+    name: showName,
+    ep: epNum,
+  });
+
+  // Keep only the 15 most recent shows so it doesn't get cluttered
+  if (history.length > 15) history.pop();
+
+  localStorage.setItem("watchHistory", JSON.stringify(history));
+}
+
+function renderContinueWatching() {
+  if (!cwContainer || !cwControls) return;
+
+  const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+
+  // Hide the section completely if they haven't watched anything yet
+  if (history.length === 0) {
+    cwContainer.classList.add("hidden");
+    return;
+  }
+
+  cwContainer.classList.remove("hidden");
+  cwControls.innerHTML = "";
+
+  history.forEach((item) => {
+    const card = document.createElement("div");
+    card.className = "history-card";
+    card.innerHTML = `
+            <div>
+                <h4>${item.name}</h4>
+                <p style="font-size: 0.85rem; color: var(--text-muted);">Resume watching</p>
+            </div>
+            <div>
+                <span class="ep-badge">Episode ${item.ep}</span>
+            </div>
+        `;
+
+    card.addEventListener("click", () => {
+      if (isSyncEnabled) {
+        socket.emit("load_show_action", {
+          showId: item.id,
+          showName: item.name,
+          targetEpNum: item.ep,
+        });
+      }
+      // Load the show! (Your existing resumePlayback logic will handle skipping to the exact second!)
+      loadEpisodes(item.id, item.name, item.ep);
+    });
+
+    cwControls.appendChild(card);
+  });
+}
