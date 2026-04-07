@@ -5,7 +5,9 @@ const searchForm = document.getElementById("search-form");
 const searchInput = document.getElementById("search-input");
 const resultsGrid = document.getElementById("results-grid");
 const loadingSpinner = document.getElementById("loading-spinner");
-const scheduleContainer = document.getElementById("schedule-container"); // ADDED THIS
+const scheduleContainer = document.getElementById("schedule-container");
+const cwContainer = document.getElementById("continue-watching-container"); // Hooked up!
+const cwControls = document.getElementById("continue-watching-controls"); // Hooked up!
 
 const backBtn = document.getElementById("back-btn");
 const showTitleEl = document.getElementById("current-show-title");
@@ -33,11 +35,12 @@ syncToggle.addEventListener("change", (e) => {
 // --- Event Listeners ---
 searchForm.addEventListener("submit", handleSearch);
 
-// Bring schedule back if user deletes their search
+// Bring schedule & history back if user deletes their search
 searchInput.addEventListener("input", (e) => {
   if (e.target.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
     resultsGrid.innerHTML = "";
+    renderContinueWatching(); // Hooked up!
   }
 });
 
@@ -69,6 +72,8 @@ videoOverlay.addEventListener("click", () => {
 
 // --- URL Routing & State Persistence ---
 document.addEventListener("DOMContentLoaded", () => {
+  renderContinueWatching(); // Hooked up!
+
   const params = new URLSearchParams(window.location.search);
   const showId = params.get("show");
   const epNum = params.get("ep");
@@ -109,8 +114,9 @@ async function handleSearch(e) {
     socket.emit("search_action", { query: query });
   }
 
-  // Hide the schedule so it doesn't overlap the search results!
+  // Hide the schedule and history so they don't overlap the search results!
   if (scheduleContainer) scheduleContainer.classList.add("hidden");
+  if (cwContainer) cwContainer.classList.add("hidden"); // Hooked up!
 
   resultsGrid.innerHTML = "";
   loadingSpinner.classList.remove("hidden");
@@ -162,6 +168,9 @@ async function loadEpisodes(
   currentShowId = showId;
   currentShowName = showName;
   currentEpNum = targetEpNum;
+
+  // Update history silently in the background
+  updateWatchHistory(showId, showName, targetEpNum); // Hooked up!
 
   showTitleEl.textContent = showName;
   showWatchView();
@@ -218,6 +227,7 @@ async function playVideo(epNum, isRemote = false) {
   }
 
   currentEpNum = epNum;
+  updateWatchHistory(currentShowId, currentShowName, epNum); // Update history if they manually switch episodes
   updateURL(currentShowId, currentShowName, epNum);
   videoOverlay.classList.remove("hidden");
   videoOverlay.innerHTML = "Buffering Stream...";
@@ -297,9 +307,10 @@ function showSearchView() {
   videoPlayer.removeAttribute("src");
   videoPlayer.load();
 
-  // If the search bar is empty, bring the schedule back
+  // Bring schedule & history back when you return to the home screen
   if (searchInput.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
+    renderContinueWatching(); // Hooked up!
     resultsGrid.innerHTML = "";
   }
 }
@@ -314,11 +325,12 @@ const socket = io();
 let isRemoteAction = false;
 
 socket.on("receive_search", async (data) => {
-  if (!isSyncEnabled) return; // Ignore if sync is off
+  if (!isSyncEnabled) return;
   searchInput.value = data.query;
 
-  // Hide schedule visually
+  // Hide UI blocks
   if (scheduleContainer) scheduleContainer.classList.add("hidden");
+  if (cwContainer) cwContainer.classList.add("hidden"); // Hooked up!
 
   resultsGrid.innerHTML = "";
   loadingSpinner.classList.remove("hidden");
@@ -499,24 +511,18 @@ function renderSchedule(animeList) {
   });
 }
 
-const cwContainer = document.getElementById("continue-watching-container");
-const cwControls = document.getElementById("continue-watching-controls");
-
-// Updates the local storage array whenever you load a new episode
+// --- Continue Watching (Watch History) ---
 function updateWatchHistory(showId, showName, epNum) {
   let history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
 
-  // Remove the show if it's already in the history (so we can move it to the front!)
   history = history.filter((item) => item.id !== showId);
 
-  // Add the newly watched episode to the very beginning of the array
   history.unshift({
     id: showId,
     name: showName,
     ep: epNum,
   });
 
-  // Keep only the 15 most recent shows so it doesn't get cluttered
   if (history.length > 15) history.pop();
 
   localStorage.setItem("watchHistory", JSON.stringify(history));
@@ -527,7 +533,6 @@ function renderContinueWatching() {
 
   const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
 
-  // Hide the section completely if they haven't watched anything yet
   if (history.length === 0) {
     cwContainer.classList.add("hidden");
     return;
@@ -557,7 +562,6 @@ function renderContinueWatching() {
           targetEpNum: item.ep,
         });
       }
-      // Load the show! (Your existing resumePlayback logic will handle skipping to the exact second!)
       loadEpisodes(item.id, item.name, item.ep);
     });
 
