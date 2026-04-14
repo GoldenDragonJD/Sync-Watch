@@ -232,6 +232,8 @@ async function playVideo(epNum, isRemote = false) {
   videoOverlay.classList.remove("hidden");
   videoOverlay.innerHTML = "Buffering Stream...";
 
+  videoPlayer.currentTime = 0;
+
   try {
     const mode = modeToggle.value;
     const res = await fetch(
