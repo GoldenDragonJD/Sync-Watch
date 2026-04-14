@@ -253,7 +253,10 @@ async function playVideo(epNum, isRemote = false) {
       const savedTime = localStorage.getItem(`save_${currentShowId}_${epNum}`);
       if (savedTime) {
         videoPlayer.currentTime = parseFloat(savedTime);
+      } else {
+        videoPlayer.currentTime = 0;
       }
+
       videoOverlay.classList.add("hidden");
 
       if (isRemote) isRemoteAction = true;

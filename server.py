@@ -370,7 +370,7 @@ def get_schedule():
 
     # If a day was provided, append it to the query
     if day:
-        jikan_url += f"?filter={day.lower()}"
+        jikan_url += f"?filter={day.lower()}&sfw=false"
 
     try:
         response = requests.get(jikan_url)
