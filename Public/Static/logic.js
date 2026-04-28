@@ -16,14 +16,17 @@ const videoPlayer = document.getElementById("video-player");
 const videoOverlay = document.getElementById("video-loading-overlay");
 const modeToggle = document.getElementById("dub-sub-toggle");
 
+// NEW DOM Elements
+const controlsContainer = document.getElementById("player-controls-container");
+const nextEpBtn = document.getElementById("next-ep-btn");
+const autoplayCheckbox = document.getElementById("autoplay-toggle");
+
 // --- Global State ---
 let currentShowId = null;
 let currentShowName = "";
 let currentHlsInstance = null;
 let currentEpNum = null;
 let currentEpisodeList = []; // Tracks the current list of episodes
-let nextEpBtn = null; // Reference for our dynamic next button
-let controlsContainer = null; // Reference for the container holding toggle & btn
 let isAutoplayEnabled = localStorage.getItem("autoplayEnabled") !== "false"; // Default to true
 
 // --- Sync Toggle State ---
@@ -80,7 +83,7 @@ videoOverlay.addEventListener("click", () => {
   videoPlayer.play();
 });
 
-// --- Next Episode Helper Logic ---
+// --- Next Episode & Autoplay Logic ---
 function playNextEpisode() {
   if (!currentEpisodeList.length) return;
   const currentIndex = currentEpisodeList.indexOf(currentEpNum.toString());
@@ -92,11 +95,18 @@ function playNextEpisode() {
   }
 }
 
-// Auto-play the next episode when the video finishes (Checks toggle preference)
+nextEpBtn.addEventListener("click", playNextEpisode);
+
 videoPlayer.addEventListener("ended", () => {
   if (isAutoplayEnabled) {
     playNextEpisode();
   }
+});
+
+autoplayCheckbox.checked = isAutoplayEnabled;
+autoplayCheckbox.addEventListener("change", (e) => {
+  isAutoplayEnabled = e.target.checked;
+  localStorage.setItem("autoplayEnabled", isAutoplayEnabled);
 });
 
 // Setup Media Session API (Allows skipping via Keyboard Media Keys or Lockscreen)
@@ -110,69 +120,11 @@ if ("mediaSession" in navigator) {
 document.addEventListener("DOMContentLoaded", () => {
   renderContinueWatching();
 
-  // Dynamically create a container for the Autoplay Toggle and Next Button
-  controlsContainer = document.createElement("div");
-  controlsContainer.style.display = "none"; // Hidden by default
-  controlsContainer.style.justifyContent = "space-between";
-  controlsContainer.style.alignItems = "center";
-  controlsContainer.style.marginTop = "1rem";
-  controlsContainer.style.gap = "1rem";
-  controlsContainer.style.flexWrap = "wrap";
-
-  // Create Autoplay Checkbox Toggle
-  const autoplayWrapper = document.createElement("label");
-  autoplayWrapper.style.display = "flex";
-  autoplayWrapper.style.alignItems = "center";
-  autoplayWrapper.style.gap = "0.5rem";
-  autoplayWrapper.style.color = "var(--text-color, #fff)";
-  autoplayWrapper.style.cursor = "pointer";
-  autoplayWrapper.style.fontWeight = "bold";
-
-  const autoplayCheckbox = document.createElement("input");
-  autoplayCheckbox.type = "checkbox";
-  autoplayCheckbox.checked = isAutoplayEnabled;
-  autoplayCheckbox.style.cursor = "pointer";
-
-  autoplayCheckbox.addEventListener("change", (e) => {
-    isAutoplayEnabled = e.target.checked;
-    localStorage.setItem("autoplayEnabled", isAutoplayEnabled);
-  });
-
-  autoplayWrapper.appendChild(autoplayCheckbox);
-  autoplayWrapper.appendChild(document.createTextNode("Autoplay Next Episode"));
-
-  // Dynamically create the Next Episode button
-  nextEpBtn = document.createElement("button");
-  nextEpBtn.id = "next-ep-btn";
-  nextEpBtn.className = "ep-btn";
-  nextEpBtn.innerHTML = "⏭ Skip to Next Episode";
-  nextEpBtn.style.flex = "1";
-  nextEpBtn.style.padding = "10px";
-  nextEpBtn.style.backgroundColor = "var(--primary)";
-  nextEpBtn.style.color = "#fff";
-  nextEpBtn.style.border = "none";
-  nextEpBtn.style.borderRadius = "8px";
-  nextEpBtn.style.cursor = "pointer";
-  nextEpBtn.style.fontWeight = "bold";
-  nextEpBtn.style.textAlign = "center";
-  nextEpBtn.style.minWidth = "200px";
-
-  nextEpBtn.addEventListener("click", playNextEpisode);
-
-  // Append elements to container, and container to the DOM below video player
-  controlsContainer.appendChild(autoplayWrapper);
-  controlsContainer.appendChild(nextEpBtn);
-  videoPlayer.parentNode.insertBefore(
-    controlsContainer,
-    videoPlayer.nextSibling,
-  );
-
   const params = new URLSearchParams(window.location.search);
   const showId = params.get("show");
   const epNum = params.get("ep");
   const showName = params.get("name") || "Anime";
 
-  // Validate that the showId from URL isn't empty or 'undefined'
   if (showId && showId !== "undefined" && showId !== "null") {
     loadEpisodes(showId, showName, epNum);
   } else {
@@ -209,7 +161,6 @@ async function handleSearch(e) {
     socket.emit("search_action", { query: query });
   }
 
-  // Hide the schedule and history so they don't overlap the search results
   if (scheduleContainer) scheduleContainer.classList.add("hidden");
   if (cwContainer) cwContainer.classList.add("hidden");
 
@@ -235,7 +186,6 @@ function renderSearchResults(shows) {
     return;
   }
 
-  // Guard: Catch backend failure payloads so they don't render as clickable cards
   if (
     shows.length === 1 &&
     shows[0].name &&
@@ -249,15 +199,12 @@ function renderSearchResults(shows) {
     const card = document.createElement("div");
     card.className = "card";
 
-    // Check what the API actually gave us
     const subCount = show.availableEpisodes?.sub;
     const dubCount = show.availableEpisodes?.dub;
 
-    // Grab whichever number is higher/exists
     const totalEps =
       subCount !== "?" ? subCount : dubCount !== "?" ? dubCount : null;
 
-    // If we have a real number, show it. Otherwise, show a clean fallback text.
     const epsText = totalEps
       ? `${totalEps} Episodes Available`
       : "View Episodes";
@@ -268,7 +215,6 @@ function renderSearchResults(shows) {
     `;
 
     card.addEventListener("click", () => {
-      // Robust ID extraction in case the API payload changes
       const id = show._id || show.id || show.url;
       if (!id) {
         alert("Sorry, this show has a broken ID and cannot be loaded.");
@@ -287,7 +233,6 @@ async function loadEpisodes(
   targetEpNum = 1,
   isRemote = false,
 ) {
-  // Guard against empty or invalid IDs that cause the //episodes 404 error
   if (!showId || showId === "undefined" || showId === "null") {
     console.error("loadEpisodes called with invalid showId:", showId);
     showSearchView();
@@ -302,13 +247,11 @@ async function loadEpisodes(
   currentShowName = showName;
   currentEpNum = targetEpNum;
 
-  // Restore the user's saved language preference for this specific anime
   const savedMode = localStorage.getItem(`langPref_${showId}`);
   if (savedMode && (savedMode === "sub" || savedMode === "dub")) {
     modeToggle.value = savedMode;
   }
 
-  // Update history silently in the background
   updateWatchHistory(showId, showName, targetEpNum);
 
   showTitleEl.textContent = showName;
@@ -318,14 +261,12 @@ async function loadEpisodes(
   episodeGrid.innerHTML = "<p>Loading episodes...</p>";
 
   try {
-    // encodeURIComponent protects against raw slashes breaking the routing
     const res = await fetch(`/api/${encodeURIComponent(showId)}/episodes`);
     if (!res.ok) throw new Error("Failed to fetch episodes");
 
     const episodeData = await res.json();
     const mode = modeToggle.value;
 
-    // Save current episodes to global state for the Next Episode feature
     currentEpisodeList = episodeData[mode] || [];
 
     renderEpisodeButtons(currentEpisodeList, targetEpNum);
@@ -382,9 +323,9 @@ async function playVideo(epNum, isRemote = false) {
   if (controlsContainer) {
     const currentIndex = currentEpisodeList.indexOf(epNum.toString());
     if (currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1) {
-      controlsContainer.style.display = "flex"; // Show controls if there's a next ep
+      controlsContainer.classList.remove("hidden"); // Show controls
     } else {
-      controlsContainer.style.display = "none"; // Hide if we are on the last ep
+      controlsContainer.classList.add("hidden"); // Hide if on last ep
     }
   }
 
@@ -394,7 +335,6 @@ async function playVideo(epNum, isRemote = false) {
 
   try {
     const mode = modeToggle.value;
-    // Safely encode the ID to prevent routing errors
     const res = await fetch(
       `/api/stream/${encodeURIComponent(currentShowId)}/${encodeURIComponent(epNum)}?mode=${mode}`,
     );
@@ -432,7 +372,6 @@ async function playVideo(epNum, isRemote = false) {
         });
       }
 
-      // Update Media Session Metadata so lockscreen shows the right Title & Episode!
       if ("mediaSession" in navigator) {
         navigator.mediaSession.metadata = new MediaMetadata({
           title: `Episode ${epNum}`,
@@ -442,7 +381,6 @@ async function playVideo(epNum, isRemote = false) {
       }
     };
 
-    // Make sure Hls is defined before trying to use it
     if (
       typeof Hls !== "undefined" &&
       Hls.isSupported() &&
@@ -487,7 +425,6 @@ function showSearchView() {
   videoPlayer.removeAttribute("src");
   videoPlayer.load();
 
-  // Bring schedule & history back when you return to the home screen
   if (searchInput.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
     renderContinueWatching();
@@ -717,13 +654,11 @@ function updateWatchHistory(showId, showName, epNum) {
 function renderContinueWatching() {
   if (!cwContainer || !cwControls) return;
 
-  // Filter out any broken history items from before the fix
   let history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
   const validHistory = history.filter(
     (item) => item && item.id && item.id !== "undefined" && item.id !== "null",
   );
 
-  // If we had to clean up broken items, save the clean version back to storage
   if (validHistory.length !== history.length) {
     localStorage.setItem("watchHistory", JSON.stringify(validHistory));
   }

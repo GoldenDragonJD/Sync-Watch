@@ -84,14 +84,30 @@
                 </div>
 
                 <div class="layout-wrapper">
-                    <div class="video-container">
-                        <video
-                            id="video-player"
-                            controls
-                            preload="auto"
-                        ></video>
-                        <div id="video-loading-overlay" class="hidden">
-                            Buffering Stream...
+                    <div class="player-column">
+                        <div class="video-container">
+                            <video
+                                id="video-player"
+                                controls
+                                preload="auto"
+                            ></video>
+                            <div id="video-loading-overlay" class="hidden">
+                                Buffering Stream...
+                            </div>
+                        </div>
+
+                        <div
+                            id="player-controls-container"
+                            class="hidden player-controls"
+                        >
+                            <label class="autoplay-label">
+                                <input type="checkbox" id="autoplay-toggle" />
+                                Autoplay Next Episode
+                            </label>
+
+                            <button id="next-ep-btn" class="ep-btn next-btn">
+                                ⏭ Skip to Next Episode
+                            </button>
                         </div>
                     </div>
 
