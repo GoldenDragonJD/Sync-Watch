@@ -1,17 +1,93 @@
+import base64
 import urllib.parse
 
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 from flask_socketio import SocketIO, emit
 
+# ==========================================
+# anipy-cli (anipy-api) Integration
+# ==========================================
+provider = None
+HAS_ANIPY = False
+Anime = None
+LANG_SUB = "sub"
+LANG_DUB = "dub"
+
+try:
+    from anipy_api.anime import Anime
+
+    try:
+        from anipy_api.provider import LanguageTypeEnum
+
+        LANG_SUB = LanguageTypeEnum.SUB
+        LANG_DUB = LanguageTypeEnum.DUB
+    except ImportError:
+        pass
+
+    from anipy_api.provider import list_providers
+
+    available_providers = list(list_providers())
+
+    # FIX 1: Aggressively hunt for AllAnime by checking the underlying Python Module and Class names
+    for p_class in available_providers:
+        c_name = getattr(p_class, "__name__", "").lower()
+        m_name = getattr(p_class, "__module__", "").lower()
+
+        if "allanime" in c_name or "allanime" in m_name:
+            provider = p_class()
+            break
+
+    # FIX 2: If AllAnime is broken/missing, fallback to AnimeKai but forcefully spoof AJAX headers
+    if provider is None:
+        for p_class in available_providers:
+            c_name = getattr(p_class, "__name__", "").lower()
+            m_name = getattr(p_class, "__module__", "").lower()
+
+            if "animekai" in c_name or "animekai" in m_name:
+                provider = p_class()
+                # AnimeKai strictly requires these AJAX headers to bypass the 403 Forbidden block
+                if hasattr(provider, "session"):
+                    provider.session.headers.update(
+                        {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Accept": "application/json, text/javascript, */*; q=0.01",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Referer": "https://animekai.to/",
+                        }
+                    )
+                break
+
+    # Failsafe
+    if provider is None and available_providers:
+        for p_class in available_providers:
+            if "native" not in getattr(p_class, "__name__", "").lower():
+                provider = p_class()
+                break
+
+    if provider is not None:
+        HAS_ANIPY = True
+        # Determine the actual name of what we loaded for the terminal log
+        actual_name = getattr(provider.__class__, "__name__", "Unknown")
+        print(f"Successfully loaded anipy-api provider: {actual_name}")
+    else:
+        print(
+            "WARNING: anipy-api provider could not be loaded. No online providers found."
+        )
+
+except ImportError as e:
+    print(f"WARNING: anipy-api modules not found: {e}")
+except Exception as e:
+    print(f"ERROR initializing provider: {e}")
+
+
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+# General headers for bypass if needed
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Referer": "https://allmanga.to",
 }
-API_URL = "https://api.allanime.day/api"
 
 
 @app.route("/proxy")
@@ -20,23 +96,20 @@ def proxy():
     if not target_url:
         return "No URL provided", 400
 
-    # Base headers to bypass the 403 Forbidden blocks
+    # FIX: Added the specific Referer back so the video server allows the connection!
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://allmanga.to",
     }
 
-    # --- THE SEEKING FIX ---
-    # If the browser is trying to seek, it will send a 'Range' header.
-    # We MUST catch it and forward it to the anime server.
+    # Pass the seeking header to the target
     range_header = request.headers.get("Range", None)
     if range_header:
         headers["Range"] = range_header
 
-    # Fetch the data
     req = requests.get(target_url, headers=headers, stream=True)
 
-    # 1. Handle HLS Playlist (.m3u8) Rewriting
+    # 1. Handle HLS Playlist (.m3u8) Rewriting for CORS bypassing
     if (
         ".m3u8" in target_url
         or "mpegurl" in req.headers.get("Content-Type", "").lower()
@@ -60,232 +133,216 @@ def proxy():
 
     # 2. Handle Video Data (Chunks or MP4)
     def generate():
-        # Stream in chunks so we don't blow up the server RAM
         for chunk in req.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 yield chunk
 
-    # --- THE SEEKING RESPONSE FIX ---
-    # We must pass the specific headers back to the browser so it knows
-    # the server successfully handled the byte-range request.
     response_headers = {
         "Content-Type": req.headers.get("Content-Type", "video/mp4"),
-        "Accept-Ranges": "bytes",  # Tells the browser "Yes, you can seek!"
+        "Accept-Ranges": "bytes",
     }
 
-    # If the anime server responded with partial content (a chunk of the video),
-    # we pass those specific length/range details back to the browser.
     if "Content-Range" in req.headers:
         response_headers["Content-Range"] = req.headers["Content-Range"]
     if "Content-Length" in req.headers:
         response_headers["Content-Length"] = req.headers["Content-Length"]
 
-    # req.status_code will be 206 if it's a partial chunk, or 200 if it's the full file.
     return Response(generate(), status=req.status_code, headers=response_headers)
 
 
+# ==========================================
+# New Scraping Logic using anipy-api
+# ==========================================
+
+
 def search_anime(query, mode="sub"):
-    search_gql = """
-    query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) {
-        shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) {
-            edges { _id name availableEpisodes __typename }
-        }
-    }
-    """
+    if not HAS_ANIPY or not provider:
+        return [
+            {
+                "name": "Error: anipy-api provider failed to load",
+                "_id": "",
+                "availableEpisodes": {"sub": "?", "dub": "?"},
+            }
+        ]
 
-    payload = {
-        "variables": {
-            "search": {"allowAdult": False, "allowUnknown": False, "query": query},
-            "limit": 40,
-            "page": 1,
-            "translationType": mode,
-            "countryOrigin": "ALL",
-        },
-        "query": search_gql,
-    }
+    search_query = f"{query} dub" if mode == "dub" else query
+    print(f"--- Searching for: {search_query} ---")
 
-    response = requests.post(API_URL, json=payload, headers=HEADERS)
-    data = response.json()
+    try:
+        search_results = provider.get_search(search_query)
+        formatted_results = []
 
-    # Returns a list of dictionaries containing _id, name, and episode counts!
-    return data["data"]["shows"]["edges"]
+        for res in search_results:
+            _id = None
+            name = "Unknown"
+            eps_sub = "?"
+            eps_dub = "?"
+
+            # Ultra-robust extraction for ID, Name, and Episode Counts
+            if isinstance(res, dict):
+                _id = (
+                    res.get("url")
+                    or res.get("slug")
+                    or res.get("id")
+                    or res.get("identifier")
+                    or res.get("link")
+                )
+                name = res.get("name") or res.get("title") or "Unknown"
+
+                # Extract episode counts if available in the dict
+                av_eps = res.get("availableEpisodes", {})
+                if isinstance(av_eps, dict):
+                    eps_sub = av_eps.get("sub", "?")
+                    eps_dub = av_eps.get("dub", "?")
+                else:
+                    eps_sub = res.get("episodes", "?")
+
+            else:
+                _id = (
+                    getattr(res, "url", None)
+                    or getattr(res, "slug", None)
+                    or getattr(res, "id", None)
+                    or getattr(res, "identifier", None)
+                    or getattr(res, "link", None)
+                )
+                name = (
+                    getattr(res, "name", None)
+                    or getattr(res, "title", None)
+                    or "Unknown"
+                )
+
+                # Extract episode counts if available as object attributes
+                av_eps = getattr(res, "availableEpisodes", None)
+                if isinstance(av_eps, dict):
+                    eps_sub = av_eps.get("sub", "?")
+                    eps_dub = av_eps.get("dub", "?")
+                else:
+                    eps_sub = getattr(
+                        res, "episodes", getattr(res, "episode_count", "?")
+                    )
+
+                if not _id and hasattr(res, "__dict__"):
+                    d = vars(res)
+                    _id = d.get("url") or d.get("slug") or d.get("id") or d.get("link")
+                    name = d.get("name") or d.get("title") or name
+
+                    av_eps_d = d.get("availableEpisodes", {})
+                    if isinstance(av_eps_d, dict):
+                        eps_sub = av_eps_d.get("sub", "?")
+                        eps_dub = av_eps_d.get("dub", "?")
+                    else:
+                        eps_sub = d.get("episodes", eps_sub)
+
+            if not _id:
+                clean_name = (
+                    str(name)
+                    .lower()
+                    .replace(" ", "-")
+                    .replace(":", "")
+                    .replace("!", "")
+                    .replace("'", "")
+                    .replace(",", "")
+                )
+                _id = f"/category/{clean_name}"
+
+            # Base64 encode the ID
+            safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8")
+            safe_id = safe_id.rstrip("=")
+
+            formatted_results.append(
+                {
+                    "_id": safe_id,
+                    "name": str(name),
+                    "availableEpisodes": {"sub": eps_sub, "dub": eps_dub},
+                    "__typename": "Anime",
+                }
+            )
+
+        if not formatted_results:
+            print("WARNING: Provider returned an empty list for this query.")
+
+        return formatted_results
+    except Exception as e:
+        print(f"Search Error: {e}")
+        return []
 
 
 def get_episodes(show_id):
-    episodes_list_gql = """
-    query ($showId: String!) {
-        show( _id: $showId ) { _id availableEpisodesDetail }
-    }
-    """
+    if not HAS_ANIPY or not provider or not Anime:
+        return {"sub": [], "dub": []}
 
-    payload = {"variables": {"showId": show_id}, "query": episodes_list_gql}
+    try:
+        # Re-add padding and decode safely
+        padded_id = show_id + "=" * (-len(show_id) % 4)
+        try:
+            real_id = base64.urlsafe_b64decode(padded_id.encode("utf-8")).decode(
+                "utf-8"
+            )
+        except:
+            real_id = show_id
 
-    response = requests.post(API_URL, json=payload, headers=HEADERS)
-    data = response.json()
+        print(f"--- Fetching episodes for decoded ID: {real_id} ---")
 
-    # Depending on 'sub' or 'dub', this returns the list of available episode numbers
-    return data["data"]["show"]["availableEpisodesDetail"]
+        anime = Anime(provider, real_id, real_id, "Unknown")
+        eps = anime.get_episodes(lang=LANG_SUB)
 
+        if not eps:
+            eps = anime.get_episodes()
 
-def get_embed_urls(show_id, episode_string, mode="sub"):
-    episode_embed_gql = """
-    query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) {
-        episode( showId: $showId translationType: $translationType episodeString: $episodeString ) {
-            episodeString sourceUrls
-        }
-    }
-    """
+        ep_numbers = []
+        if eps:
+            ep_numbers = [str(getattr(ep, "number", i + 1)) for i, ep in enumerate(eps)]
 
-    payload = {
-        "variables": {
-            "showId": show_id,
-            "translationType": mode,
-            "episodeString": str(episode_string),
-        },
-        "query": episode_embed_gql,
-    }
-
-    response = requests.post(API_URL, json=payload, headers=HEADERS)
-    return response.json()
+        return {"sub": ep_numbers, "dub": ep_numbers}
+    except Exception as e:
+        print(f"Episodes Error: {e}")
+        return {"sub": [], "dub": []}
 
 
-def decrypt_source_url(encrypted_str):
-    # Remove the starting "--"
-    if encrypted_str.startswith("--"):
-        encrypted_str = encrypted_str[2:]
-
-    # The exact cipher mapped from the ani-cli bash script
-    cipher_map = {
-        "79": "A",
-        "7a": "B",
-        "7b": "C",
-        "7c": "D",
-        "7d": "E",
-        "7e": "F",
-        "7f": "G",
-        "70": "H",
-        "71": "I",
-        "72": "J",
-        "73": "K",
-        "74": "L",
-        "75": "M",
-        "76": "N",
-        "77": "O",
-        "68": "P",
-        "69": "Q",
-        "6a": "R",
-        "6b": "S",
-        "6c": "T",
-        "6d": "U",
-        "6e": "V",
-        "6f": "W",
-        "60": "X",
-        "61": "Y",
-        "62": "Z",
-        "59": "a",
-        "5a": "b",
-        "5b": "c",
-        "5c": "d",
-        "5d": "e",
-        "5e": "f",
-        "5f": "g",
-        "50": "h",
-        "51": "i",
-        "52": "j",
-        "53": "k",
-        "54": "l",
-        "55": "m",
-        "56": "n",
-        "57": "o",
-        "48": "p",
-        "49": "q",
-        "4a": "r",
-        "4b": "s",
-        "4c": "t",
-        "4d": "u",
-        "4e": "v",
-        "4f": "w",
-        "40": "x",
-        "41": "y",
-        "42": "z",
-        "08": "0",
-        "09": "1",
-        "0a": "2",
-        "0b": "3",
-        "0c": "4",
-        "0d": "5",
-        "0e": "6",
-        "0f": "7",
-        "00": "8",
-        "01": "9",
-        "15": "-",
-        "16": ".",
-        "67": "_",
-        "46": "~",
-        "02": ":",
-        "17": "/",
-        "07": "?",
-        "1b": "#",
-        "63": "[",
-        "65": "]",
-        "78": "@",
-        "19": "!",
-        "1c": "$",
-        "1e": "&",
-        "10": "(",
-        "11": ")",
-        "12": "*",
-        "13": "+",
-        "14": ",",
-        "03": ";",
-        "05": "=",
-        "1d": "%",
-    }
-
-    decrypted = ""
-    for i in range(0, len(encrypted_str), 2):
-        pair = encrypted_str[i : i + 2]
-        # FIXED: Added the += assignment
-        decrypted += cipher_map.get(pair, pair)
-
-    return decrypted.replace("/clock", "/clock.json")
-
-
-def get_actual_video_link(decoded_path):
-    # 1. Format the URL correctly depending on what the cipher returned
-    if decoded_path.startswith("http"):
-        final_url = decoded_path
-    elif decoded_path.startswith("//"):
-        final_url = f"https:{decoded_path}"
-    else:
-        final_url = f"https://allanime.day{decoded_path}"
-
-    if "clock.json" not in final_url:
-        return final_url
-
-    response = requests.get(final_url, headers=HEADERS)
-
-    if response.status_code != 200:
+def get_stream_for_episode(show_id, episode_string, mode="sub"):
+    if not HAS_ANIPY or not provider or not Anime:
         return None
 
     try:
-        data = response.json()
-        if "links" in data and len(data["links"]) > 0:
-            # Try to find a 1080p link first
-            for link_obj in data["links"]:
-                if "1080" in str(link_obj.get("resolutionStr", "")):
-                    return link_obj["link"]
-            # If no 1080p, try 720p
-            for link_obj in data["links"]:
-                if "720" in str(link_obj.get("resolutionStr", "")):
-                    return link_obj["link"]
+        # Re-add padding and decode safely
+        padded_id = show_id + "=" * (-len(show_id) % 4)
+        try:
+            real_id = base64.urlsafe_b64decode(padded_id.encode("utf-8")).decode(
+                "utf-8"
+            )
+        except:
+            real_id = show_id
 
-            # Fallback to the first available link
-            return data["links"][0]["link"]
+        anime = Anime(provider, real_id, real_id, "Unknown")
+        lang = LANG_DUB if mode == "dub" else LANG_SUB
+
+        # Parse episode string safely
+        try:
+            ep_num = float(episode_string)
+            if ep_num.is_integer():
+                ep_num = int(ep_num)
+        except ValueError:
+            ep_num = episode_string
+
+        stream = anime.get_video(episode=ep_num, lang=lang, preferred_quality=1080)
+
+        if stream:
+            return getattr(stream, "url", None)
+
+        # Fallback without quality parameter
+        stream = anime.get_video(episode=ep_num, lang=lang)
+        if stream:
+            return getattr(stream, "url", None)
+
+        return None
     except Exception as e:
-        print(f"Error parsing JSON: {e}")
+        print(f"Stream Error: {e}")
+        return None
 
-    return None
+
+# ==========================================
+# Routes
+# ==========================================
 
 
 @app.route("/")
@@ -303,72 +360,57 @@ def logic():
     return send_file("Public/Static/logic.js", mimetype="text/javascript")
 
 
-@app.route("/api/search/<anime>")
+@app.route("/api/search/<path:anime>")
 def search(anime):
     mode = request.args.get("mode", "sub")
     results = search_anime(anime, mode)
     return jsonify(results)
 
 
-@app.route("/api/<show_id>/episodes")
+# Using <path:show_id> to catch IDs that might contain slashes like 'category/naruto'
+@app.route("/api/<path:show_id>/episodes")
 def show(show_id):
     results = get_episodes(show_id)
     return jsonify(results)
 
 
-@app.route("/api/embed/<show_id>/<episode_string>")
+@app.route("/api/embed/<path:show_id>/<episode_string>")
 def embed(show_id, episode_string):
     mode = request.args.get("mode", "sub")
-    results = get_embed_urls(show_id, episode_string, mode)
-    return jsonify(results)
+    stream_url = get_stream_for_episode(show_id, episode_string, mode)
+
+    if stream_url:
+        return jsonify(
+            {
+                "data": {
+                    "episode": {
+                        "sourceUrls": [
+                            {"sourceName": "anipy-cli GoGo", "sourceUrl": stream_url}
+                        ]
+                    }
+                }
+            }
+        )
+    return jsonify({"error": "No embed found"}), 404
 
 
-@app.route("/api/stream/<show_id>/<episode_string>")
+@app.route("/api/stream/<path:show_id>/<episode_string>")
 def get_stream(show_id, episode_string):
     mode = request.args.get("mode", "sub")
-
-    # 1. Get the list of embed URLs for this episode
-    embed_data = get_embed_urls(show_id, episode_string, mode)
-
-    # Safety check: make sure we got valid data back
-    if "data" not in embed_data or "episode" not in embed_data["data"]:
-        return jsonify({"error": "Could not fetch episode data"}), 404
-
-    source_urls = embed_data["data"]["episode"]["sourceUrls"]
-
-    # 2. Hunt for the best provider (Luf-Mp4 or Yt-mp4 are best for raw links)
-    target_encrypted_url = None
-    for source in source_urls:
-        name = source.get("sourceName")
-        url = source.get("sourceUrl", "")
-
-        if name in ["Luf-Mp4", "Yt-mp4", "S-mp4"] and url.startswith("--"):
-            target_encrypted_url = url
-            break  # We found a good one, stop looking
-
-    if not target_encrypted_url:
-        return jsonify({"error": "No raw stream provider found for this episode."}), 404
-
-    # 3. Decrypt the URL
-    decoded_path = decrypt_source_url(target_encrypted_url)
-
-    # 4. Fetch the final .m3u8 link
-    final_video_link = get_actual_video_link(decoded_path)
+    final_video_link = get_stream_for_episode(show_id, episode_string, mode)
 
     if final_video_link:
         return jsonify({"status": "success", "stream_url": final_video_link})
     else:
-        return jsonify({"error": "Failed to extract final video link."}), 500
+        return jsonify(
+            {"error": "Failed to extract final video link using anipy-cli provider."}
+        ), 500
 
 
 @app.route("/api/schedule")
 def get_schedule():
     day = request.args.get("day")
-
-    # Jikan v4 schedule endpoint takes a 'filter' parameter for the day of the week
     jikan_url = "https://api.jikan.moe/v4/schedules"
-
-    # If a day was provided, append it to the query
     if day:
         jikan_url += f"?filter={day.lower()}&sfw=false"
 
@@ -382,9 +424,13 @@ def get_schedule():
         return jsonify({"error": str(e)}), 500
 
 
+# ==========================================
+# Socket.IO Event Handlers (Unchanged)
+# ==========================================
+
+
 @socketio.on("search_action")
 def handle_search_sync(data):
-    # Broadcast the search query to everyone ELSE in the room
     emit("receive_search", data, broadcast=True, include_self=False)
 
 
@@ -405,19 +451,16 @@ def handle_seek_sync(data):
 
 @socketio.on("load_show_action")
 def handle_load_show_sync(data):
-    # Syncs clicking a show card from the search results
     emit("receive_load_show", data, broadcast=True, include_self=False)
 
 
 @socketio.on("load_episode_action")
 def handle_load_episode_sync(data):
-    # Syncs clicking a specific episode number button
     emit("receive_load_episode", data, broadcast=True, include_self=False)
 
 
 @socketio.on("back_action")
 def handle_back_sync():
-    # Syncs clicking the "Back to Search" button
     emit("receive_back", broadcast=True, include_self=False)
 
 

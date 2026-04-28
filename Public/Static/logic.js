@@ -6,8 +6,8 @@ const searchInput = document.getElementById("search-input");
 const resultsGrid = document.getElementById("results-grid");
 const loadingSpinner = document.getElementById("loading-spinner");
 const scheduleContainer = document.getElementById("schedule-container");
-const cwContainer = document.getElementById("continue-watching-container"); // Hooked up!
-const cwControls = document.getElementById("continue-watching-controls"); // Hooked up!
+const cwContainer = document.getElementById("continue-watching-container");
+const cwControls = document.getElementById("continue-watching-controls");
 
 const backBtn = document.getElementById("back-btn");
 const showTitleEl = document.getElementById("current-show-title");
@@ -25,12 +25,14 @@ let currentEpNum = null;
 // --- Sync Toggle State ---
 const syncToggle = document.getElementById("sync-toggle");
 let isSyncEnabled = localStorage.getItem("syncEnabled") === "true";
-syncToggle.checked = isSyncEnabled;
+if (syncToggle) syncToggle.checked = isSyncEnabled;
 
-syncToggle.addEventListener("change", (e) => {
-  isSyncEnabled = e.target.checked;
-  localStorage.setItem("syncEnabled", isSyncEnabled);
-});
+if (syncToggle) {
+  syncToggle.addEventListener("change", (e) => {
+    isSyncEnabled = e.target.checked;
+    localStorage.setItem("syncEnabled", isSyncEnabled);
+  });
+}
 
 // --- Event Listeners ---
 searchForm.addEventListener("submit", handleSearch);
@@ -40,14 +42,14 @@ searchInput.addEventListener("input", (e) => {
   if (e.target.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
     resultsGrid.innerHTML = "";
-    renderContinueWatching(); // Hooked up!
+    renderContinueWatching();
   }
 });
 
 backBtn.addEventListener("click", () => {
   updateURL("");
   showSearchView();
-  if (isSyncEnabled) {
+  if (isSyncEnabled && typeof socket !== "undefined") {
     socket.emit("back_action");
   }
 });
@@ -72,14 +74,15 @@ videoOverlay.addEventListener("click", () => {
 
 // --- URL Routing & State Persistence ---
 document.addEventListener("DOMContentLoaded", () => {
-  renderContinueWatching(); // Hooked up!
+  renderContinueWatching();
 
   const params = new URLSearchParams(window.location.search);
   const showId = params.get("show");
   const epNum = params.get("ep");
   const showName = params.get("name") || "Anime";
 
-  if (showId) {
+  // Validate that the showId from URL isn't empty or 'undefined'
+  if (showId && showId !== "undefined" && showId !== "null") {
     loadEpisodes(showId, showName, epNum);
   } else {
     showSearchView();
@@ -87,18 +90,19 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 function updateURL(showId, showName, epNum) {
-  if (!showId) {
+  if (!showId || showId === "undefined" || showId === "null") {
     window.history.pushState({}, "", "/");
   } else {
-    const newUrl = `/?show=${showId}&name=${encodeURIComponent(showName)}&ep=${epNum || 1}`;
+    const newUrl = `/?show=${encodeURIComponent(showId)}&name=${encodeURIComponent(showName)}&ep=${epNum || 1}`;
     window.history.pushState({}, "", newUrl);
   }
 }
 
 window.addEventListener("popstate", () => {
   const params = new URLSearchParams(window.location.search);
-  if (params.get("show")) {
-    loadEpisodes(params.get("show"), params.get("name"), params.get("ep"));
+  const showId = params.get("show");
+  if (showId && showId !== "undefined" && showId !== "null") {
+    loadEpisodes(showId, params.get("name"), params.get("ep"));
   } else {
     showSearchView();
   }
@@ -110,13 +114,13 @@ async function handleSearch(e) {
   const query = searchInput.value.trim();
   if (!query) return;
 
-  if (isSyncEnabled) {
+  if (isSyncEnabled && typeof socket !== "undefined") {
     socket.emit("search_action", { query: query });
   }
 
-  // Hide the schedule and history so they don't overlap the search results!
+  // Hide the schedule and history so they don't overlap the search results
   if (scheduleContainer) scheduleContainer.classList.add("hidden");
-  if (cwContainer) cwContainer.classList.add("hidden"); // Hooked up!
+  if (cwContainer) cwContainer.classList.add("hidden");
 
   resultsGrid.innerHTML = "";
   loadingSpinner.classList.remove("hidden");
@@ -126,6 +130,7 @@ async function handleSearch(e) {
     const data = await res.json();
     renderSearchResults(data);
   } catch (err) {
+    console.error(err);
     resultsGrid.innerHTML =
       '<p class="text-danger">Failed to fetch results.</p>';
   } finally {
@@ -139,18 +144,48 @@ function renderSearchResults(shows) {
     return;
   }
 
+  // Guard: Catch backend failure payloads so they don't render as clickable cards
+  if (
+    shows.length === 1 &&
+    shows[0].name &&
+    shows[0].name.startsWith("Error:")
+  ) {
+    resultsGrid.innerHTML = `<p class="text-danger" style="color: #ff4c4c; font-weight: bold; text-align: center; margin-top: 2rem;">Backend Server Issue: ${shows[0].name}</p>`;
+    return;
+  }
+
   shows.forEach((show) => {
     const card = document.createElement("div");
     card.className = "card";
+
+    // Check what the API actually gave us
+    const subCount = show.availableEpisodes?.sub;
+    const dubCount = show.availableEpisodes?.dub;
+
+    // Grab whichever number is higher/exists
     const totalEps =
-      show.availableEpisodes?.sub || show.availableEpisodes?.dub || "?";
+      subCount !== "?" ? subCount : dubCount !== "?" ? dubCount : null;
+
+    // If we have a real number, show it. Otherwise, show a clean fallback text.
+    const epsText = totalEps
+      ? `${totalEps} Episodes Available`
+      : "View Episodes";
 
     card.innerHTML = `
       <h3>${show.name}</h3>
-      <p>${totalEps} Episodes Available</p>
+      <p class="eps-text" style="color: var(--primary); font-size: 0.9rem;">${epsText}</p>
     `;
 
-    card.addEventListener("click", () => loadEpisodes(show._id, show.name, 1));
+    card.addEventListener("click", () => {
+      // Robust ID extraction in case the API payload changes
+      const id = show._id || show.id || show.url;
+      if (!id) {
+        alert("Sorry, this show has a broken ID and cannot be loaded.");
+        return;
+      }
+      loadEpisodes(id, show.name, 1);
+    });
+
     resultsGrid.appendChild(card);
   });
 }
@@ -161,7 +196,14 @@ async function loadEpisodes(
   targetEpNum = 1,
   isRemote = false,
 ) {
-  if (!isRemote && isSyncEnabled) {
+  // Guard against empty or invalid IDs that cause the //episodes 404 error
+  if (!showId || showId === "undefined" || showId === "null") {
+    console.error("loadEpisodes called with invalid showId:", showId);
+    showSearchView();
+    return;
+  }
+
+  if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
     socket.emit("load_show_action", { showId, showName, targetEpNum });
   }
 
@@ -170,7 +212,7 @@ async function loadEpisodes(
   currentEpNum = targetEpNum;
 
   // Update history silently in the background
-  updateWatchHistory(showId, showName, targetEpNum); // Hooked up!
+  updateWatchHistory(showId, showName, targetEpNum);
 
   showTitleEl.textContent = showName;
   showWatchView();
@@ -179,7 +221,10 @@ async function loadEpisodes(
   episodeGrid.innerHTML = "<p>Loading episodes...</p>";
 
   try {
-    const res = await fetch(`/api/${showId}/episodes`);
+    // encodeURIComponent protects against raw slashes breaking the routing
+    const res = await fetch(`/api/${encodeURIComponent(showId)}/episodes`);
+    if (!res.ok) throw new Error("Failed to fetch episodes");
+
     const episodeData = await res.json();
     const mode = modeToggle.value;
     const episodes = episodeData[mode] || [];
@@ -193,7 +238,9 @@ async function loadEpisodes(
       playVideo(targetEpNum, isRemote);
     }
   } catch (err) {
-    episodeGrid.innerHTML = "<p>Error loading episodes.</p>";
+    console.error(err);
+    episodeGrid.innerHTML =
+      "<p>Error loading episodes. Please go back and try again.</p>";
   }
 }
 
@@ -222,27 +269,31 @@ function renderEpisodeButtons(episodes, activeEpNum) {
 }
 
 async function playVideo(epNum, isRemote = false) {
-  if (!isRemote && isSyncEnabled) {
+  if (!currentShowId) return;
+
+  if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
     socket.emit("load_episode_action", { epNum });
   }
 
   currentEpNum = epNum;
-  updateWatchHistory(currentShowId, currentShowName, epNum); // Update history if they manually switch episodes
+  updateWatchHistory(currentShowId, currentShowName, epNum);
   updateURL(currentShowId, currentShowName, epNum);
+
   videoOverlay.classList.remove("hidden");
   videoOverlay.innerHTML = "Buffering Stream...";
-
   videoPlayer.currentTime = 0;
 
   try {
     const mode = modeToggle.value;
+    // Safely encode the ID to prevent routing errors
     const res = await fetch(
-      `/api/stream/${currentShowId}/${epNum}?mode=${mode}`,
+      `/api/stream/${encodeURIComponent(currentShowId)}/${encodeURIComponent(epNum)}?mode=${mode}`,
     );
     const data = await res.json();
 
-    if (data.status !== "success" || !data.stream_url)
+    if (data.status !== "success" || !data.stream_url) {
       throw new Error("Stream not found");
+    }
 
     const proxyUrl = `/proxy?url=${encodeURIComponent(data.stream_url)}`;
 
@@ -273,7 +324,12 @@ async function playVideo(epNum, isRemote = false) {
       }
     };
 
-    if (Hls.isSupported() && data.stream_url.includes(".m3u8")) {
+    // Make sure Hls is defined before trying to use it
+    if (
+      typeof Hls !== "undefined" &&
+      Hls.isSupported() &&
+      data.stream_url.includes(".m3u8")
+    ) {
       currentHlsInstance = new Hls({
         capLevelToPlayerSize: false,
         startLevel: -1,
@@ -300,6 +356,7 @@ async function playVideo(epNum, isRemote = false) {
       videoPlayer.load();
     }
   } catch (err) {
+    console.error(err);
     videoOverlay.innerHTML = "Failed to load stream.";
     videoOverlay.classList.remove("hidden");
   }
@@ -315,7 +372,7 @@ function showSearchView() {
   // Bring schedule & history back when you return to the home screen
   if (searchInput.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
-    renderContinueWatching(); // Hooked up!
+    renderContinueWatching();
     resultsGrid.innerHTML = "";
   }
 }
@@ -326,92 +383,94 @@ function showWatchView() {
 }
 
 // --- WebSocket Setup & Watch Party Logic ---
-const socket = io();
+const socket = typeof io !== "undefined" ? io() : null;
 let isRemoteAction = false;
 
-socket.on("receive_search", async (data) => {
-  if (!isSyncEnabled) return;
-  searchInput.value = data.query;
+if (socket) {
+  socket.on("receive_search", async (data) => {
+    if (!isSyncEnabled) return;
+    searchInput.value = data.query;
 
-  // Hide UI blocks
-  if (scheduleContainer) scheduleContainer.classList.add("hidden");
-  if (cwContainer) cwContainer.classList.add("hidden"); // Hooked up!
+    if (scheduleContainer) scheduleContainer.classList.add("hidden");
+    if (cwContainer) cwContainer.classList.add("hidden");
 
-  resultsGrid.innerHTML = "";
-  loadingSpinner.classList.remove("hidden");
-  try {
-    const res = await fetch(`/api/search/${encodeURIComponent(data.query)}`);
-    const searchData = await res.json();
-    renderSearchResults(searchData);
+    resultsGrid.innerHTML = "";
+    loadingSpinner.classList.remove("hidden");
+    try {
+      const res = await fetch(`/api/search/${encodeURIComponent(data.query)}`);
+      const searchData = await res.json();
+      renderSearchResults(searchData);
+      showSearchView();
+    } catch (err) {
+      console.error("Remote search failed", err);
+    } finally {
+      loadingSpinner.classList.add("hidden");
+    }
+  });
+
+  socket.on("receive_play", (data) => {
+    if (!isSyncEnabled) return;
+    isRemoteAction = true;
+    if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
+      videoPlayer.currentTime = data.time;
+    }
+    videoPlayer.play();
+  });
+
+  socket.on("receive_load_show", (data) => {
+    if (!isSyncEnabled) return;
+    loadEpisodes(data.showId, data.showName, data.targetEpNum, true);
+  });
+
+  socket.on("receive_load_episode", (data) => {
+    if (!isSyncEnabled) return;
+    document.querySelectorAll(".ep-btn").forEach((b) => {
+      b.classList.remove("active");
+      if (b.textContent == data.epNum) b.classList.add("active");
+    });
+    playVideo(data.epNum, true);
+  });
+
+  socket.on("receive_back", () => {
+    if (!isSyncEnabled) return;
+    updateURL("");
     showSearchView();
-  } catch (err) {
-    console.error("Remote search failed", err);
-  } finally {
-    loadingSpinner.classList.add("hidden");
-  }
-});
+  });
 
+  socket.on("receive_pause", (data) => {
+    if (!isSyncEnabled) return;
+    isRemoteAction = true;
+    videoPlayer.currentTime = data.time;
+    videoPlayer.pause();
+  });
+
+  socket.on("receive_seek", (data) => {
+    if (!isSyncEnabled) return;
+    isRemoteAction = true;
+    videoPlayer.currentTime = data.time;
+  });
+}
+
+// Video Player Event Listeners for Sockets
 videoPlayer.addEventListener("play", () => {
-  if (!isRemoteAction && isSyncEnabled) {
+  if (!isRemoteAction && isSyncEnabled && socket) {
     socket.emit("play_action", { time: videoPlayer.currentTime });
   }
   isRemoteAction = false;
 });
 
-socket.on("receive_play", (data) => {
-  if (!isSyncEnabled) return;
-  isRemoteAction = true;
-  if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
-    videoPlayer.currentTime = data.time;
-  }
-  videoPlayer.play();
-});
-
-socket.on("receive_load_show", (data) => {
-  if (!isSyncEnabled) return;
-  loadEpisodes(data.showId, data.showName, data.targetEpNum, true);
-});
-
-socket.on("receive_load_episode", (data) => {
-  if (!isSyncEnabled) return;
-  document.querySelectorAll(".ep-btn").forEach((b) => {
-    b.classList.remove("active");
-    if (b.textContent == data.epNum) b.classList.add("active");
-  });
-  playVideo(data.epNum, true);
-});
-
-socket.on("receive_back", () => {
-  if (!isSyncEnabled) return;
-  updateURL("");
-  showSearchView();
-});
-
 videoPlayer.addEventListener("pause", () => {
-  if (!isRemoteAction && isSyncEnabled) {
+  if (!isRemoteAction && isSyncEnabled && socket) {
     socket.emit("pause_action", { time: videoPlayer.currentTime });
   }
   isRemoteAction = false;
 });
 
-socket.on("receive_pause", (data) => {
-  if (!isSyncEnabled) return;
-  isRemoteAction = true;
-  videoPlayer.currentTime = data.time;
-  videoPlayer.pause();
-});
-
 videoPlayer.addEventListener("seeked", () => {
-  if (!isRemoteAction && isSyncEnabled) {
+  if (!isRemoteAction && isSyncEnabled && socket) {
     socket.emit("seek_action", { time: videoPlayer.currentTime });
   }
   isRemoteAction = false;
-});
-
-socket.on("receive_seek", (data) => {
-  if (!isSyncEnabled) return;
-  isRemoteAction = true;
-  videoPlayer.currentTime = data.time;
 });
 
 // --- Jikan Schedule Integration ---
@@ -430,7 +489,7 @@ const daysOfWeek = [
 ];
 
 document.addEventListener("DOMContentLoaded", () => {
-  buildDayFilters();
+  if (scheduleControls) buildDayFilters();
 });
 
 function buildDayFilters() {
@@ -459,6 +518,8 @@ function buildDayFilters() {
 }
 
 async function fetchSchedule(dayName, titleLabel) {
+  if (!scheduleTitle || !scheduleGrid) return;
+
   scheduleTitle.textContent = "Loading...";
   scheduleGrid.innerHTML = "";
 
@@ -504,7 +565,7 @@ function renderSchedule(animeList) {
 
     card.addEventListener("click", () => {
       searchInput.value = title;
-      if (isSyncEnabled) {
+      if (isSyncEnabled && socket) {
         socket.emit("search_action", { query: title });
       }
       searchForm.dispatchEvent(
@@ -518,6 +579,8 @@ function renderSchedule(animeList) {
 
 // --- Continue Watching (Watch History) ---
 function updateWatchHistory(showId, showName, epNum) {
+  if (!showId || showId === "undefined" || showId === "null") return;
+
   let history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
 
   history = history.filter((item) => item.id !== showId);
@@ -536,9 +599,18 @@ function updateWatchHistory(showId, showName, epNum) {
 function renderContinueWatching() {
   if (!cwContainer || !cwControls) return;
 
-  const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+  // Filter out any broken history items from before the fix
+  let history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+  const validHistory = history.filter(
+    (item) => item && item.id && item.id !== "undefined" && item.id !== "null",
+  );
 
-  if (history.length === 0) {
+  // If we had to clean up broken items, save the clean version back to storage
+  if (validHistory.length !== history.length) {
+    localStorage.setItem("watchHistory", JSON.stringify(validHistory));
+  }
+
+  if (validHistory.length === 0) {
     cwContainer.classList.add("hidden");
     return;
   }
@@ -546,7 +618,7 @@ function renderContinueWatching() {
   cwContainer.classList.remove("hidden");
   cwControls.innerHTML = "";
 
-  history.forEach((item) => {
+  validHistory.forEach((item) => {
     const card = document.createElement("div");
     card.className = "history-card";
     card.innerHTML = `
@@ -560,7 +632,7 @@ function renderContinueWatching() {
         `;
 
     card.addEventListener("click", () => {
-      if (isSyncEnabled) {
+      if (isSyncEnabled && socket) {
         socket.emit("load_show_action", {
           showId: item.id,
           showName: item.name,
