@@ -70,6 +70,10 @@ modeToggle.addEventListener("change", () => {
 });
 
 videoPlayer.addEventListener("timeupdate", () => {
+  // FIX: Do not save timestamp if the video is currently buffering a new episode!
+  // This prevents the old video's timestamp from bleeding into the next episode.
+  if (!videoOverlay.classList.contains("hidden")) return;
+
   if (currentShowId && currentEpNum && videoPlayer.currentTime > 0) {
     localStorage.setItem(
       `save_${currentShowId}_${currentEpNum}`,
@@ -84,14 +88,28 @@ videoOverlay.addEventListener("click", () => {
 });
 
 // --- Next Episode & Autoplay Logic ---
+let isSkipping = false; // Prevents double-skips if Watch Party peers both auto-play
+
 function playNextEpisode() {
-  if (!currentEpisodeList.length) return;
+  if (isSkipping || !currentEpisodeList.length) return;
   const currentIndex = currentEpisodeList.indexOf(currentEpNum.toString());
 
   // If there is a next episode in the array, load it
   if (currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1) {
+    isSkipping = true;
+    setTimeout(() => {
+      isSkipping = false;
+    }, 2000); // 2-second cooldown
+
     const nextEp = currentEpisodeList[currentIndex + 1];
-    loadEpisodes(currentShowId, currentShowName, nextEp);
+
+    // Visually update the active button
+    document.querySelectorAll(".ep-btn").forEach((b) => {
+      b.classList.remove("active");
+      if (b.textContent == nextEp) b.classList.add("active");
+    });
+
+    playVideo(nextEp);
   }
 }
 
@@ -239,6 +257,9 @@ async function loadEpisodes(
     return;
   }
 
+  // FIX: Pause the video immediately so it doesn't bleed its time into the next load!
+  videoPlayer.pause();
+
   if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
     socket.emit("load_show_action", { showId, showName, targetEpNum });
   }
@@ -311,6 +332,9 @@ function renderEpisodeButtons(episodes, activeEpNum) {
 async function playVideo(epNum, isRemote = false) {
   if (!currentShowId) return;
 
+  // FIX: Pause the video immediately!
+  videoPlayer.pause();
+
   if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
     socket.emit("load_episode_action", { epNum });
   }
@@ -331,7 +355,7 @@ async function playVideo(epNum, isRemote = false) {
 
   videoOverlay.classList.remove("hidden");
   videoOverlay.innerHTML = "Buffering Stream...";
-  videoPlayer.currentTime = 0;
+  // REMOVED: videoPlayer.currentTime = 0; from here. It is handled cleanly in resumePlayback.
 
   try {
     const mode = modeToggle.value;
