@@ -21,6 +21,10 @@ let currentShowId = null;
 let currentShowName = "";
 let currentHlsInstance = null;
 let currentEpNum = null;
+let currentEpisodeList = []; // Tracks the current list of episodes
+let nextEpBtn = null; // Reference for our dynamic next button
+let controlsContainer = null; // Reference for the container holding toggle & btn
+let isAutoplayEnabled = localStorage.getItem("autoplayEnabled") !== "false"; // Default to true
 
 // --- Sync Toggle State ---
 const syncToggle = document.getElementById("sync-toggle");
@@ -55,7 +59,11 @@ backBtn.addEventListener("click", () => {
 });
 
 modeToggle.addEventListener("change", () => {
-  if (currentShowId) loadEpisodes(currentShowId, currentShowName, currentEpNum);
+  if (currentShowId) {
+    // Save the language preference specifically for this anime
+    localStorage.setItem(`langPref_${currentShowId}`, modeToggle.value);
+    loadEpisodes(currentShowId, currentShowName, currentEpNum);
+  }
 });
 
 videoPlayer.addEventListener("timeupdate", () => {
@@ -72,9 +80,92 @@ videoOverlay.addEventListener("click", () => {
   videoPlayer.play();
 });
 
+// --- Next Episode Helper Logic ---
+function playNextEpisode() {
+  if (!currentEpisodeList.length) return;
+  const currentIndex = currentEpisodeList.indexOf(currentEpNum.toString());
+
+  // If there is a next episode in the array, load it
+  if (currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1) {
+    const nextEp = currentEpisodeList[currentIndex + 1];
+    loadEpisodes(currentShowId, currentShowName, nextEp);
+  }
+}
+
+// Auto-play the next episode when the video finishes (Checks toggle preference)
+videoPlayer.addEventListener("ended", () => {
+  if (isAutoplayEnabled) {
+    playNextEpisode();
+  }
+});
+
+// Setup Media Session API (Allows skipping via Keyboard Media Keys or Lockscreen)
+if ("mediaSession" in navigator) {
+  navigator.mediaSession.setActionHandler("nexttrack", () => {
+    playNextEpisode();
+  });
+}
+
 // --- URL Routing & State Persistence ---
 document.addEventListener("DOMContentLoaded", () => {
   renderContinueWatching();
+
+  // Dynamically create a container for the Autoplay Toggle and Next Button
+  controlsContainer = document.createElement("div");
+  controlsContainer.style.display = "none"; // Hidden by default
+  controlsContainer.style.justifyContent = "space-between";
+  controlsContainer.style.alignItems = "center";
+  controlsContainer.style.marginTop = "1rem";
+  controlsContainer.style.gap = "1rem";
+  controlsContainer.style.flexWrap = "wrap";
+
+  // Create Autoplay Checkbox Toggle
+  const autoplayWrapper = document.createElement("label");
+  autoplayWrapper.style.display = "flex";
+  autoplayWrapper.style.alignItems = "center";
+  autoplayWrapper.style.gap = "0.5rem";
+  autoplayWrapper.style.color = "var(--text-color, #fff)";
+  autoplayWrapper.style.cursor = "pointer";
+  autoplayWrapper.style.fontWeight = "bold";
+
+  const autoplayCheckbox = document.createElement("input");
+  autoplayCheckbox.type = "checkbox";
+  autoplayCheckbox.checked = isAutoplayEnabled;
+  autoplayCheckbox.style.cursor = "pointer";
+
+  autoplayCheckbox.addEventListener("change", (e) => {
+    isAutoplayEnabled = e.target.checked;
+    localStorage.setItem("autoplayEnabled", isAutoplayEnabled);
+  });
+
+  autoplayWrapper.appendChild(autoplayCheckbox);
+  autoplayWrapper.appendChild(document.createTextNode("Autoplay Next Episode"));
+
+  // Dynamically create the Next Episode button
+  nextEpBtn = document.createElement("button");
+  nextEpBtn.id = "next-ep-btn";
+  nextEpBtn.className = "ep-btn";
+  nextEpBtn.innerHTML = "⏭ Skip to Next Episode";
+  nextEpBtn.style.flex = "1";
+  nextEpBtn.style.padding = "10px";
+  nextEpBtn.style.backgroundColor = "var(--primary)";
+  nextEpBtn.style.color = "#fff";
+  nextEpBtn.style.border = "none";
+  nextEpBtn.style.borderRadius = "8px";
+  nextEpBtn.style.cursor = "pointer";
+  nextEpBtn.style.fontWeight = "bold";
+  nextEpBtn.style.textAlign = "center";
+  nextEpBtn.style.minWidth = "200px";
+
+  nextEpBtn.addEventListener("click", playNextEpisode);
+
+  // Append elements to container, and container to the DOM below video player
+  controlsContainer.appendChild(autoplayWrapper);
+  controlsContainer.appendChild(nextEpBtn);
+  videoPlayer.parentNode.insertBefore(
+    controlsContainer,
+    videoPlayer.nextSibling,
+  );
 
   const params = new URLSearchParams(window.location.search);
   const showId = params.get("show");
@@ -211,6 +302,12 @@ async function loadEpisodes(
   currentShowName = showName;
   currentEpNum = targetEpNum;
 
+  // Restore the user's saved language preference for this specific anime
+  const savedMode = localStorage.getItem(`langPref_${showId}`);
+  if (savedMode && (savedMode === "sub" || savedMode === "dub")) {
+    modeToggle.value = savedMode;
+  }
+
   // Update history silently in the background
   updateWatchHistory(showId, showName, targetEpNum);
 
@@ -227,13 +324,15 @@ async function loadEpisodes(
 
     const episodeData = await res.json();
     const mode = modeToggle.value;
-    const episodes = episodeData[mode] || [];
 
-    renderEpisodeButtons(episodes, targetEpNum);
+    // Save current episodes to global state for the Next Episode feature
+    currentEpisodeList = episodeData[mode] || [];
+
+    renderEpisodeButtons(currentEpisodeList, targetEpNum);
 
     if (
-      episodes.includes(targetEpNum.toString()) ||
-      episodes.includes(Number(targetEpNum))
+      currentEpisodeList.includes(targetEpNum.toString()) ||
+      currentEpisodeList.includes(Number(targetEpNum))
     ) {
       playVideo(targetEpNum, isRemote);
     }
@@ -279,6 +378,16 @@ async function playVideo(epNum, isRemote = false) {
   updateWatchHistory(currentShowId, currentShowName, epNum);
   updateURL(currentShowId, currentShowName, epNum);
 
+  // Manage Next Button Visibility
+  if (controlsContainer) {
+    const currentIndex = currentEpisodeList.indexOf(epNum.toString());
+    if (currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1) {
+      controlsContainer.style.display = "flex"; // Show controls if there's a next ep
+    } else {
+      controlsContainer.style.display = "none"; // Hide if we are on the last ep
+    }
+  }
+
   videoOverlay.classList.remove("hidden");
   videoOverlay.innerHTML = "Buffering Stream...";
   videoPlayer.currentTime = 0;
@@ -320,6 +429,15 @@ async function playVideo(epNum, isRemote = false) {
           console.warn("Autoplay blocked by browser:", error);
           videoOverlay.innerHTML = "Click Video to Play";
           videoOverlay.classList.remove("hidden");
+        });
+      }
+
+      // Update Media Session Metadata so lockscreen shows the right Title & Episode!
+      if ("mediaSession" in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: `Episode ${epNum}`,
+          artist: currentShowName,
+          album: "Watch Together",
         });
       }
     };
