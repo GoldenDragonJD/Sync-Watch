@@ -921,3 +921,88 @@ function renderContinueWatching() {
     cwControls.appendChild(card);
   });
 }
+
+// ==========================================
+// 3. Update Progress Bar, Buffer, & Time Display
+// ==========================================
+
+let isDraggingProgress = false;
+
+// Stop timeupdate from fighting our mouse
+progressBar.addEventListener("mousedown", () => (isDraggingProgress = true));
+progressBar.addEventListener("touchstart", () => (isDraggingProgress = true));
+
+progressBar.addEventListener("mouseup", () => (isDraggingProgress = false));
+progressBar.addEventListener("touchend", () => (isDraggingProgress = false));
+
+// Listen to the 'progress' event to map the video buffer
+videoPlayer.addEventListener("progress", () => {
+  if (videoPlayer.duration > 0 && videoPlayer.buffered.length > 0) {
+    // Find the furthest buffered point
+    const bufferedEnd = videoPlayer.buffered.end(
+      videoPlayer.buffered.length - 1,
+    );
+    const bufferPercent = (bufferedEnd / videoPlayer.duration) * 100;
+
+    // Inject the variable into CSS
+    progressBar.style.setProperty("--buffered-pct", `${bufferPercent}%`);
+  }
+});
+
+videoPlayer.addEventListener("timeupdate", () => {
+  if (!videoOverlay.classList.contains("hidden")) return;
+  if (!videoPlayer.duration) return;
+
+  const currentTime = videoPlayer.currentTime;
+
+  // Only update the bar's position if the user IS NOT dragging it
+  if (!isDraggingProgress) {
+    const progressPercent = (currentTime / videoPlayer.duration) * 100;
+    progressBar.value = progressPercent;
+    // Inject the played variable into CSS
+    progressBar.style.setProperty("--played-pct", `${progressPercent}%`);
+  }
+
+  // Update UI text
+  timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
+
+  // --- Watch History ---
+  if (currentShowId && currentEpNum && currentTime > 0) {
+    localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
+  }
+
+  // --- AniSkip Logic ---
+  if (currentSkipTimes.length > 0) {
+    const matchingSkip = currentSkipTimes.find(
+      (skip) => currentTime >= skip.start && currentTime <= skip.end,
+    );
+
+    if (matchingSkip) {
+      if (activeSkip !== matchingSkip) {
+        activeSkip = matchingSkip;
+        showSkipButton(matchingSkip);
+      }
+    } else {
+      if (activeSkip !== null) {
+        activeSkip = null;
+        hideSkipButton();
+      }
+    }
+  }
+});
+
+// ==========================================
+// 4. Seek via Custom Progress Bar
+// ==========================================
+
+// 'input' fires continuously while dragging. We update the CSS visually, but DO NOT seek the video yet to avoid stuttering.
+progressBar.addEventListener("input", (e) => {
+  progressBar.style.setProperty("--played-pct", `${e.target.value}%`);
+});
+
+// 'change' fires only when the user lets go of the mouse/finger (or clicks). This is when we actually seek the video.
+progressBar.addEventListener("change", (e) => {
+  const newTime = (e.target.value / 100) * videoPlayer.duration;
+  videoPlayer.currentTime = newTime;
+  // (Note: Changing currentTime naturally fires the 'seeked' event when done, handling Watch Party Sync!)
+});

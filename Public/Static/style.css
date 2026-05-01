@@ -577,6 +577,71 @@ input[type="range"]:focus {
     width: 80px;
 }
 
+/* Update these progress bar styles in your CSS */
+.progress-container {
+    width: 100%;
+    padding: 5px 0;
+}
+
+input[type="range"] {
+    -webkit-appearance: none;
+    width: 100%;
+    background: transparent;
+    cursor: pointer;
+    /* We will update these CSS variables from Javascript! */
+    --played-pct: 0%;
+    --buffered-pct: 0%;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 14px;
+    width: 14px;
+    border-radius: 50%;
+    background: var(--primary);
+    cursor: pointer;
+    margin-top: -4px; /* Centers the dot on the thicker track */
+    box-shadow: 0 0 4px rgba(0, 0, 0, 0.5); /* Adds a nice shadow to the dot */
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+    width: 100%;
+    height: 6px; /* Slightly thicker */
+    cursor: pointer;
+    border-radius: 3px;
+    /* This paints the played portion, the buffered portion, and the empty portion dynamically */
+    background: linear-gradient(
+        to right,
+        var(--primary) 0%,
+        var(--primary) var(--played-pct),
+        rgba(255, 255, 255, 0.4) var(--played-pct),
+        rgba(255, 255, 255, 0.4) var(--buffered-pct),
+        rgba(255, 255, 255, 0.15) var(--buffered-pct),
+        rgba(255, 255, 255, 0.15) 100%
+    );
+}
+
+/* Firefox Support for the track */
+input[type="range"]::-moz-range-track {
+    width: 100%;
+    height: 6px;
+    cursor: pointer;
+    border-radius: 3px;
+    background: linear-gradient(
+        to right,
+        var(--primary) 0%,
+        var(--primary) var(--played-pct),
+        rgba(255, 255, 255, 0.4) var(--played-pct),
+        rgba(255, 255, 255, 0.4) var(--buffered-pct),
+        rgba(255, 255, 255, 0.15) var(--buffered-pct),
+        rgba(255, 255, 255, 0.15) 100%
+    );
+}
+
+input[type="range"]:focus {
+    outline: none;
+}
+
 /* =========================================
    Mobile Responsiveness
    ========================================= */
