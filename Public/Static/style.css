@@ -621,6 +621,30 @@ input[type="range"]::-webkit-slider-runnable-track {
     );
 }
 
+/* =========================================
+   Hover Time Tooltip
+   ========================================= */
+#hover-time-tooltip {
+    position: absolute;
+    bottom: 25px; /* Floats it right above the bar */
+    left: 0;
+    transform: translateX(
+        -50%
+    ); /* Keeps the point perfectly centered on the mouse */
+    background-color: var(--bg-card);
+    color: var(--text-main);
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: bold;
+    font-variant-numeric: tabular-nums; /* Keeps numbers perfectly aligned */
+    pointer-events: none; /* CRITICAL: Prevents the tooltip from blocking mouse clicks! */
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.5);
+    z-index: 100;
+    transition: opacity 0.2s ease;
+}
+
 /* Firefox Support for the track */
 input[type="range"]::-moz-range-track {
     width: 100%;

@@ -29,6 +29,7 @@ const volumeBar = document.getElementById("volume-bar");
 const timeDisplay = document.getElementById("time-display");
 const fullscreenBtn = document.getElementById("fullscreen-btn");
 const skipButton = document.getElementById("skip-button");
+const hoverTooltip = document.getElementById("hover-time-tooltip");
 
 // --- Global State ---
 let currentShowId = null;
@@ -132,6 +133,40 @@ progressBar.addEventListener("input", (e) => {
   const newTime = (e.target.value / 100) * videoPlayer.duration;
   videoPlayer.currentTime = newTime;
   // (Note: Changing currentTime naturally fires the 'seeked' event when done, handling Watch Party Sync!)
+});
+
+// --- Hover Tooltip Logic ---
+
+progressBar.addEventListener("mousemove", (e) => {
+  if (!videoPlayer.duration) return;
+
+  // Get the exact dimensions and position of the progress bar
+  const rect = progressBar.getBoundingClientRect();
+
+  // Calculate mouse position relative to the left edge of the bar
+  let mouseX = e.clientX - rect.left;
+
+  // Clamp values so it doesn't break if you drag slightly outside the bar bounds
+  mouseX = Math.max(0, Math.min(mouseX, rect.width));
+
+  // Calculate the time that pixel represents
+  const hoverTime = (mouseX / rect.width) * videoPlayer.duration;
+
+  // Update the text and move the tooltip
+  hoverTooltip.textContent = formatTime(hoverTime);
+  hoverTooltip.style.left = `${mouseX}px`;
+});
+
+// Show tooltip when mouse enters the bar area
+progressBar.addEventListener("mouseenter", () => {
+  if (videoPlayer.duration) {
+    hoverTooltip.style.opacity = "1";
+  }
+});
+
+// Hide tooltip when mouse leaves
+progressBar.addEventListener("mouseleave", () => {
+  hoverTooltip.style.opacity = "0";
 });
 
 // 5. Volume Controls
