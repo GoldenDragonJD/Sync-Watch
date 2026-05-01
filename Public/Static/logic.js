@@ -16,18 +16,31 @@ const videoPlayer = document.getElementById("video-player");
 const videoOverlay = document.getElementById("video-loading-overlay");
 const modeToggle = document.getElementById("dub-sub-toggle");
 
-// NEW DOM Elements
 const controlsContainer = document.getElementById("player-controls-container");
 const nextEpBtn = document.getElementById("next-ep-btn");
 const autoplayCheckbox = document.getElementById("autoplay-toggle");
+
+// NEW: Custom Player DOM Elements
+const videoWrapper = document.getElementById("video-wrapper");
+const playPauseBtn = document.getElementById("play-pause-btn");
+const progressBar = document.getElementById("progress-bar");
+const muteBtn = document.getElementById("mute-btn");
+const volumeBar = document.getElementById("volume-bar");
+const timeDisplay = document.getElementById("time-display");
+const fullscreenBtn = document.getElementById("fullscreen-btn");
+const skipButton = document.getElementById("skip-button");
 
 // --- Global State ---
 let currentShowId = null;
 let currentShowName = "";
 let currentHlsInstance = null;
 let currentEpNum = null;
-let currentEpisodeList = []; // Tracks the current list of episodes
-let isAutoplayEnabled = localStorage.getItem("autoplayEnabled") !== "false"; // Default to true
+let currentEpisodeList = [];
+let isAutoplayEnabled = localStorage.getItem("autoplayEnabled") !== "false";
+
+// NEW Global State for AniSkip
+let currentSkipTimes = [];
+let activeSkip = null;
 
 // --- Sync Toggle State ---
 const syncToggle = document.getElementById("sync-toggle");
@@ -41,10 +54,136 @@ if (syncToggle) {
   });
 }
 
-// --- Event Listeners ---
+// =========================================
+// CUSTOM VIDEO PLAYER LOGIC
+// =========================================
+
+// 1. Play & Pause
+function togglePlay() {
+  if (videoPlayer.paused) {
+    videoPlayer.play();
+  } else {
+    videoPlayer.pause();
+  }
+}
+playPauseBtn.addEventListener("click", togglePlay);
+videoPlayer.addEventListener("click", togglePlay);
+
+// Update UI and trigger Sync logic when native events fire
+videoPlayer.addEventListener("play", () => {
+  playPauseBtn.textContent = "⏸";
+  videoWrapper.classList.remove("paused");
+});
+
+videoPlayer.addEventListener("pause", () => {
+  playPauseBtn.textContent = "▶";
+  videoWrapper.classList.add("paused");
+});
+
+// 2. Formatting Time helper (e.g., 65s -> "01:05")
+function formatTime(seconds) {
+  if (isNaN(seconds)) return "00:00";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m < 10 ? "0" : ""}${m}:${s < 10 ? "0" : ""}${s}`;
+}
+
+// 3. Update Progress Bar & Time Display
+videoPlayer.addEventListener("timeupdate", () => {
+  if (!videoOverlay.classList.contains("hidden")) return;
+  if (!videoPlayer.duration) return;
+
+  const currentTime = videoPlayer.currentTime;
+
+  // Update UI slider
+  const progressPercent = (currentTime / videoPlayer.duration) * 100;
+  progressBar.value = progressPercent;
+
+  // Update UI text
+  timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
+
+  // 1. Save Watch History
+  if (currentShowId && currentEpNum && currentTime > 0) {
+    localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
+  }
+
+  // 2. AniSkip Logic
+  if (currentSkipTimes.length > 0) {
+    const matchingSkip = currentSkipTimes.find(
+      (skip) => currentTime >= skip.start && currentTime <= skip.end,
+    );
+
+    if (matchingSkip) {
+      if (activeSkip !== matchingSkip) {
+        activeSkip = matchingSkip;
+        showSkipButton(matchingSkip);
+      }
+    } else {
+      if (activeSkip !== null) {
+        activeSkip = null;
+        hideSkipButton();
+      }
+    }
+  }
+});
+
+// 4. Seek via Custom Progress Bar
+progressBar.addEventListener("input", (e) => {
+  const newTime = (e.target.value / 100) * videoPlayer.duration;
+  videoPlayer.currentTime = newTime;
+  // (Note: Changing currentTime naturally fires the 'seeked' event when done, handling Watch Party Sync!)
+});
+
+// 5. Volume Controls
+volumeBar.addEventListener("input", (e) => {
+  videoPlayer.volume = e.target.value;
+  videoPlayer.muted = false;
+  updateMuteIcon();
+});
+
+function updateMuteIcon() {
+  if (videoPlayer.muted || videoPlayer.volume === 0) muteBtn.textContent = "🔇";
+  else if (videoPlayer.volume < 0.5) muteBtn.textContent = "🔉";
+  else muteBtn.textContent = "🔊";
+}
+
+muteBtn.addEventListener("click", () => {
+  videoPlayer.muted = !videoPlayer.muted;
+  if (videoPlayer.muted) volumeBar.value = 0;
+  else volumeBar.value = videoPlayer.volume || 1;
+  updateMuteIcon();
+});
+
+// 6. Fullscreen Handler (Targets Wrapper, not Video!)
+function toggleFullScreen() {
+  if (!document.fullscreenElement) {
+    if (videoWrapper.requestFullscreen) videoWrapper.requestFullscreen();
+    else if (videoWrapper.webkitRequestFullscreen)
+      videoWrapper.webkitRequestFullscreen();
+    else if (videoWrapper.msRequestFullscreen)
+      videoWrapper.msRequestFullscreen();
+  } else {
+    if (document.exitFullscreen) document.exitFullscreen();
+    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    else if (document.msExitFullscreen) document.msExitFullscreen();
+  }
+}
+
+fullscreenBtn.addEventListener("click", toggleFullScreen);
+videoWrapper.addEventListener("dblclick", toggleFullScreen);
+
+// Loading overlay click
+videoOverlay.addEventListener("click", () => {
+  videoOverlay.classList.add("hidden");
+  videoPlayer.play();
+});
+
+// =========================================
+// STANDARD APP LOGIC
+// =========================================
+
 searchForm.addEventListener("submit", handleSearch);
 
-// Bring schedule & history back if user deletes their search
 searchInput.addEventListener("input", (e) => {
   if (e.target.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
@@ -63,47 +202,26 @@ backBtn.addEventListener("click", () => {
 
 modeToggle.addEventListener("change", () => {
   if (currentShowId) {
-    // Save the language preference specifically for this anime
     localStorage.setItem(`langPref_${currentShowId}`, modeToggle.value);
     loadEpisodes(currentShowId, currentShowName, currentEpNum);
   }
 });
 
-videoPlayer.addEventListener("timeupdate", () => {
-  // FIX: Do not save timestamp if the video is currently buffering a new episode!
-  // This prevents the old video's timestamp from bleeding into the next episode.
-  if (!videoOverlay.classList.contains("hidden")) return;
-
-  if (currentShowId && currentEpNum && videoPlayer.currentTime > 0) {
-    localStorage.setItem(
-      `save_${currentShowId}_${currentEpNum}`,
-      videoPlayer.currentTime,
-    );
-  }
-});
-
-videoOverlay.addEventListener("click", () => {
-  videoOverlay.classList.add("hidden");
-  videoPlayer.play();
-});
-
 // --- Next Episode & Autoplay Logic ---
-let isSkipping = false; // Prevents double-skips if Watch Party peers both auto-play
+let isSkipping = false;
 
 function playNextEpisode() {
   if (isSkipping || !currentEpisodeList.length) return;
   const currentIndex = currentEpisodeList.indexOf(currentEpNum.toString());
 
-  // If there is a next episode in the array, load it
   if (currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1) {
     isSkipping = true;
     setTimeout(() => {
       isSkipping = false;
-    }, 2000); // 2-second cooldown
+    }, 2000);
 
     const nextEp = currentEpisodeList[currentIndex + 1];
 
-    // Visually update the active button
     document.querySelectorAll(".ep-btn").forEach((b) => {
       b.classList.remove("active");
       if (b.textContent == nextEp) b.classList.add("active");
@@ -127,7 +245,6 @@ autoplayCheckbox.addEventListener("change", (e) => {
   localStorage.setItem("autoplayEnabled", isAutoplayEnabled);
 });
 
-// Setup Media Session API (Allows skipping via Keyboard Media Keys or Lockscreen)
 if ("mediaSession" in navigator) {
   navigator.mediaSession.setActionHandler("nexttrack", () => {
     playNextEpisode();
@@ -168,6 +285,83 @@ window.addEventListener("popstate", () => {
     showSearchView();
   }
 });
+
+// --- AniSkip Core Functions ---
+async function resolveMalId(showId, showName) {
+  if (/^\d+$/.test(showId)) {
+    return parseInt(showId, 10);
+  }
+
+  console.log("ID is not a MAL integer. Searching Jikan for MAL ID...");
+  try {
+    const cleanName = showName.replace(/\(Dub\)|\(Sub\)/gi, "").trim();
+    const res = await fetch(
+      `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(cleanName)}&limit=1`,
+    );
+    const json = await res.json();
+
+    if (json.data && json.data.length > 0) {
+      const malId = json.data[0].mal_id;
+      console.log(`Successfully mapped "${showName}" to MAL ID: ${malId}`);
+      return malId;
+    }
+  } catch (err) {
+    console.warn("Failed to resolve MAL ID via Jikan:", err);
+  }
+
+  console.warn(`Could not resolve a MAL ID for ${showName}`);
+  return null;
+}
+
+async function fetchSkipTimes(malId, epNum) {
+  currentSkipTimes = [];
+  activeSkip = null;
+  hideSkipButton();
+
+  try {
+    const res = await fetch(
+      `https://api.aniskip.com/v2/skip-times/${malId}/${epNum}?types=op&types=ed&types=mixed-op&types=mixed-ed&types=recap&episodeLength=0`,
+    );
+
+    if (!res.ok) throw new Error(`AniSkip returned ${res.status}`);
+
+    const data = await res.json();
+    if (data.found && data.results) {
+      currentSkipTimes = data.results.map((r) => ({
+        type: r.skipType,
+        start: r.interval.startTime,
+        end: r.interval.endTime,
+      }));
+      console.log("Loaded skip times:", currentSkipTimes);
+    }
+  } catch (err) {
+    console.warn("Failed to fetch skip times or no skips available:", err);
+  }
+}
+
+function showSkipButton(skipData) {
+  if (!skipButton) return;
+  skipButton.classList.remove("hidden");
+
+  if (skipData.type === "op") skipButton.textContent = "Skip Intro";
+  else if (skipData.type === "ed") skipButton.textContent = "Skip Outro";
+  else skipButton.textContent = "Skip";
+
+  skipButton.onclick = () => {
+    videoPlayer.currentTime = skipData.end;
+    hideSkipButton();
+
+    if (isSyncEnabled && typeof socket !== "undefined") {
+      socket.emit("seek_action", { time: skipData.end });
+    }
+  };
+}
+
+function hideSkipButton() {
+  if (!skipButton) return;
+  skipButton.classList.add("hidden");
+  skipButton.onclick = null;
+}
 
 // --- Core Functions ---
 async function handleSearch(e) {
@@ -222,7 +416,6 @@ function renderSearchResults(shows) {
 
     const totalEps =
       subCount !== "?" ? subCount : dubCount !== "?" ? dubCount : null;
-
     const epsText = totalEps
       ? `${totalEps} Episodes Available`
       : "View Episodes";
@@ -257,7 +450,6 @@ async function loadEpisodes(
     return;
   }
 
-  // FIX: Pause the video immediately so it doesn't bleed its time into the next load!
   videoPlayer.pause();
 
   if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
@@ -329,10 +521,10 @@ function renderEpisodeButtons(episodes, activeEpNum) {
   });
 }
 
+// UPDATED: playVideo triggers AniSkip fetch
 async function playVideo(epNum, isRemote = false) {
   if (!currentShowId) return;
 
-  // FIX: Pause the video immediately!
   videoPlayer.pause();
 
   if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
@@ -343,19 +535,24 @@ async function playVideo(epNum, isRemote = false) {
   updateWatchHistory(currentShowId, currentShowName, epNum);
   updateURL(currentShowId, currentShowName, epNum);
 
-  // Manage Next Button Visibility
+  // --- ANISKIP FETCH ---
+  resolveMalId(currentShowId, currentShowName).then((malId) => {
+    if (malId) {
+      fetchSkipTimes(malId, epNum);
+    }
+  });
+
   if (controlsContainer) {
     const currentIndex = currentEpisodeList.indexOf(epNum.toString());
     if (currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1) {
-      controlsContainer.classList.remove("hidden"); // Show controls
+      controlsContainer.classList.remove("hidden");
     } else {
-      controlsContainer.classList.add("hidden"); // Hide if on last ep
+      controlsContainer.classList.add("hidden");
     }
   }
 
   videoOverlay.classList.remove("hidden");
   videoOverlay.innerHTML = "Buffering Stream...";
-  // REMOVED: videoPlayer.currentTime = 0; from here. It is handled cleanly in resumePlayback.
 
   try {
     const mode = modeToggle.value;
@@ -393,6 +590,7 @@ async function playVideo(epNum, isRemote = false) {
           console.warn("Autoplay blocked by browser:", error);
           videoOverlay.innerHTML = "Click Video to Play";
           videoOverlay.classList.remove("hidden");
+          videoWrapper.classList.add("paused"); // Ensure play button shows properly
         });
       }
 
@@ -531,6 +729,7 @@ if (socket) {
 }
 
 // Video Player Event Listeners for Sockets
+// (Since custom controls fire these native events, sync works flawlessly!)
 videoPlayer.addEventListener("play", () => {
   if (!isRemoteAction && isSyncEnabled && socket) {
     socket.emit("play_action", { time: videoPlayer.currentTime });
