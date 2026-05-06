@@ -666,6 +666,18 @@ input[type="range"]:focus {
     outline: none;
 }
 
+.idle-hidden {
+    cursor: none !important;
+}
+
+/* Added .custom-controls here so the video player UI hides properly! */
+.idle-hidden .custom-controls,
+.idle-hidden #player-controls-container,
+.idle-hidden #hover-time-tooltip {
+    opacity: 0 !important; /* Force hide even if hovering */
+    pointer-events: none !important; /* Prevent invisible clicks */
+}
+
 /* =========================================
    Mobile Responsiveness
    ========================================= */

@@ -42,6 +42,8 @@ let isAutoplayEnabled = localStorage.getItem("autoplayEnabled") !== "false";
 // NEW Global State for AniSkip
 let currentSkipTimes = [];
 let activeSkip = null;
+let currentStreamFetchId = 0;
+let idleTimer;
 
 // --- Sync Toggle State ---
 const syncToggle = document.getElementById("sync-toggle");
@@ -59,6 +61,31 @@ if (syncToggle) {
 // CUSTOM VIDEO PLAYER LOGIC
 // =========================================
 
+function showUIAndResetTimer() {
+  videoWrapper.classList.remove("idle-hidden");
+
+  clearTimeout(idleTimer);
+
+  // Only hide automatically if the video is actively playing
+  if (!videoPlayer.paused) {
+    idleTimer = setTimeout(() => {
+      console.log("3 seconds passed - hiding UI now!");
+      videoWrapper.classList.add("idle-hidden");
+    }, 3000); // 3 seconds of idle time
+  }
+}
+
+// Listen for interactions on the video wrapper
+videoWrapper.addEventListener("mousemove", showUIAndResetTimer);
+videoWrapper.addEventListener("mousedown", showUIAndResetTimer);
+videoWrapper.addEventListener("touchstart", showUIAndResetTimer);
+
+// Also keep UI visible when paused
+videoPlayer.addEventListener("pause", () => {
+  videoWrapper.classList.remove("idle-hidden");
+  clearTimeout(idleTimer);
+});
+
 // 1. Play & Pause
 function togglePlay() {
   if (videoPlayer.paused) {
@@ -74,6 +101,7 @@ videoPlayer.addEventListener("click", togglePlay);
 videoPlayer.addEventListener("play", () => {
   playPauseBtn.textContent = "⏸";
   videoWrapper.classList.remove("paused");
+  showUIAndResetTimer();
 });
 
 videoPlayer.addEventListener("pause", () => {
@@ -140,7 +168,7 @@ progressBar.addEventListener("input", (e) => {
 progressBar.addEventListener("mousemove", (e) => {
   if (!videoPlayer.duration) return;
 
-  // Get the exact dimensions and position of the progress bar
+  // Get the exact dimensions and position of the progress barc
   const rect = progressBar.getBoundingClientRect();
 
   // Calculate mouse position relative to the left edge of the bar
@@ -466,7 +494,16 @@ function renderSearchResults(shows) {
         alert("Sorry, this show has a broken ID and cannot be loaded.");
         return;
       }
-      loadEpisodes(id, show.name, 1);
+
+      // Look up history instead of hardcoding 1
+      let targetEp = 1;
+      const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+      const savedShow = history.find((item) => item.id === id);
+      if (savedShow && savedShow.ep) {
+        targetEp = savedShow.ep;
+      }
+
+      loadEpisodes(id, show.name, targetEp);
     });
 
     resultsGrid.appendChild(card);
@@ -562,15 +599,18 @@ async function playVideo(epNum, isRemote = false) {
 
   videoPlayer.pause();
 
+  // Increment the fetch ID every time playVideo is called
+  currentStreamFetchId++;
+  const fetchId = currentStreamFetchId;
+
   if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
     socket.emit("load_episode_action", { epNum });
   }
 
   currentEpNum = epNum;
   updateWatchHistory(currentShowId, currentShowName, epNum);
-  updateURL(currentShowId, currentShowName, epNum);
+  updateURL(currentShowId, currentShowName, epNum); // --- ANISKIP FETCH ---
 
-  // --- ANISKIP FETCH ---
   resolveMalId(currentShowId, currentShowName).then((malId) => {
     if (malId) {
       fetchSkipTimes(malId, epNum);
@@ -595,6 +635,12 @@ async function playVideo(epNum, isRemote = false) {
       `/api/stream/${encodeURIComponent(currentShowId)}/${encodeURIComponent(epNum)}?mode=${mode}`,
     );
     const data = await res.json();
+
+    // NEW: If another episode was clicked while this was fetching, abort!
+    if (fetchId !== currentStreamFetchId) {
+      console.log("Aborted stale stream fetch for episode:", epNum);
+      return;
+    }
 
     if (data.status !== "success" || !data.stream_url) {
       throw new Error("Stream not found");
