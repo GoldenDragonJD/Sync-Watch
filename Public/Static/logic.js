@@ -39,11 +39,12 @@ let currentEpNum = null;
 let currentEpisodeList = [];
 let isAutoplayEnabled = localStorage.getItem("autoplayEnabled") !== "false";
 
-// NEW Global State for AniSkip
+// NEW Global State for AniSkip & Sockets
 let currentSkipTimes = [];
 let activeSkip = null;
 let currentStreamFetchId = 0;
 let idleTimer;
+let isRemoteAction = false; // Prevents recursive Socket.IO echo loops
 
 // --- Sync Toggle State ---
 const syncToggle = document.getElementById("sync-toggle");
@@ -66,21 +67,17 @@ function showUIAndResetTimer() {
 
   clearTimeout(idleTimer);
 
-  // Only hide automatically if the video is actively playing
   if (!videoPlayer.paused) {
     idleTimer = setTimeout(() => {
-      console.log("3 seconds passed - hiding UI now!");
       videoWrapper.classList.add("idle-hidden");
-    }, 3000); // 3 seconds of idle time
+    }, 3000);
   }
 }
 
-// Listen for interactions on the video wrapper
 videoWrapper.addEventListener("mousemove", showUIAndResetTimer);
 videoWrapper.addEventListener("mousedown", showUIAndResetTimer);
 videoWrapper.addEventListener("touchstart", showUIAndResetTimer);
 
-// Also keep UI visible when paused
 videoPlayer.addEventListener("pause", () => {
   videoWrapper.classList.remove("idle-hidden");
   clearTimeout(idleTimer);
@@ -97,19 +94,49 @@ function togglePlay() {
 playPauseBtn.addEventListener("click", togglePlay);
 videoPlayer.addEventListener("click", togglePlay);
 
-// Update UI and trigger Sync logic when native events fire
+// Native Video Events -> Sync Broadcasts
 videoPlayer.addEventListener("play", () => {
   playPauseBtn.textContent = "⏸";
   videoWrapper.classList.remove("paused");
   showUIAndResetTimer();
+
+  // If this play was triggered by the server, consume the flag and don't echo
+  if (isRemoteAction) {
+    isRemoteAction = false;
+    return;
+  }
+
+  if (isSyncEnabled && typeof socket !== "undefined") {
+    socket.emit("play_action", { time: videoPlayer.currentTime });
+  }
 });
 
 videoPlayer.addEventListener("pause", () => {
   playPauseBtn.textContent = "▶";
   videoWrapper.classList.add("paused");
+
+  if (isRemoteAction) {
+    isRemoteAction = false;
+    return;
+  }
+
+  if (isSyncEnabled && typeof socket !== "undefined") {
+    socket.emit("pause_action", { time: videoPlayer.currentTime });
+  }
 });
 
-// 2. Formatting Time helper (e.g., 65s -> "01:05")
+videoPlayer.addEventListener("seeked", () => {
+  if (isRemoteAction) {
+    isRemoteAction = false;
+    return;
+  }
+
+  if (isSyncEnabled && typeof socket !== "undefined") {
+    socket.emit("seek_action", { time: videoPlayer.currentTime });
+  }
+});
+
+// 2. Formatting Time helper
 function formatTime(seconds) {
   if (isNaN(seconds)) return "00:00";
   const m = Math.floor(seconds / 60);
@@ -124,19 +151,15 @@ videoPlayer.addEventListener("timeupdate", () => {
 
   const currentTime = videoPlayer.currentTime;
 
-  // Update UI slider
   const progressPercent = (currentTime / videoPlayer.duration) * 100;
   progressBar.value = progressPercent;
 
-  // Update UI text
   timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
 
-  // 1. Save Watch History
   if (currentShowId && currentEpNum && currentTime > 0) {
     localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
   }
 
-  // 2. AniSkip Logic
   if (currentSkipTimes.length > 0) {
     const matchingSkip = currentSkipTimes.find(
       (skip) => currentTime >= skip.start && currentTime <= skip.end,
@@ -160,39 +183,27 @@ videoPlayer.addEventListener("timeupdate", () => {
 progressBar.addEventListener("input", (e) => {
   const newTime = (e.target.value / 100) * videoPlayer.duration;
   videoPlayer.currentTime = newTime;
-  // (Note: Changing currentTime naturally fires the 'seeked' event when done, handling Watch Party Sync!)
 });
 
 // --- Hover Tooltip Logic ---
-
 progressBar.addEventListener("mousemove", (e) => {
   if (!videoPlayer.duration) return;
 
-  // Get the exact dimensions and position of the progress barc
   const rect = progressBar.getBoundingClientRect();
-
-  // Calculate mouse position relative to the left edge of the bar
   let mouseX = e.clientX - rect.left;
-
-  // Clamp values so it doesn't break if you drag slightly outside the bar bounds
   mouseX = Math.max(0, Math.min(mouseX, rect.width));
-
-  // Calculate the time that pixel represents
   const hoverTime = (mouseX / rect.width) * videoPlayer.duration;
 
-  // Update the text and move the tooltip
   hoverTooltip.textContent = formatTime(hoverTime);
   hoverTooltip.style.left = `${mouseX}px`;
 });
 
-// Show tooltip when mouse enters the bar area
 progressBar.addEventListener("mouseenter", () => {
   if (videoPlayer.duration) {
     hoverTooltip.style.opacity = "1";
   }
 });
 
-// Hide tooltip when mouse leaves
 progressBar.addEventListener("mouseleave", () => {
   hoverTooltip.style.opacity = "0";
 });
@@ -217,7 +228,7 @@ muteBtn.addEventListener("click", () => {
   updateMuteIcon();
 });
 
-// 6. Fullscreen Handler (Targets Wrapper, not Video!)
+// 6. Fullscreen Handler
 function toggleFullScreen() {
   if (!document.fullscreenElement) {
     if (videoWrapper.requestFullscreen) videoWrapper.requestFullscreen();
@@ -270,7 +281,6 @@ modeToggle.addEventListener("change", () => {
   }
 });
 
-// --- Next Episode & Autoplay Logic ---
 let isSkipping = false;
 
 function playNextEpisode() {
@@ -314,7 +324,6 @@ if ("mediaSession" in navigator) {
   });
 }
 
-// --- URL Routing & State Persistence ---
 document.addEventListener("DOMContentLoaded", () => {
   renderContinueWatching();
 
@@ -349,7 +358,6 @@ window.addEventListener("popstate", () => {
   }
 });
 
-// --- AniSkip Core Functions ---
 async function resolveMalId(showId, showName) {
   if (/^\d+$/.test(showId)) {
     return parseInt(showId, 10);
@@ -413,10 +421,6 @@ function showSkipButton(skipData) {
   skipButton.onclick = () => {
     videoPlayer.currentTime = skipData.end;
     hideSkipButton();
-
-    if (isSyncEnabled && typeof socket !== "undefined") {
-      socket.emit("seek_action", { time: skipData.end });
-    }
   };
 }
 
@@ -426,7 +430,6 @@ function hideSkipButton() {
   skipButton.onclick = null;
 }
 
-// --- Core Functions ---
 async function handleSearch(e) {
   e.preventDefault();
   const query = searchInput.value.trim();
@@ -495,7 +498,6 @@ function renderSearchResults(shows) {
         return;
       }
 
-      // Look up history instead of hardcoding 1
       let targetEp = 1;
       const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
       const savedShow = history.find((item) => item.id === id);
@@ -593,13 +595,11 @@ function renderEpisodeButtons(episodes, activeEpNum) {
   });
 }
 
-// UPDATED: playVideo triggers AniSkip fetch
 async function playVideo(epNum, isRemote = false) {
   if (!currentShowId) return;
 
   videoPlayer.pause();
 
-  // Increment the fetch ID every time playVideo is called
   currentStreamFetchId++;
   const fetchId = currentStreamFetchId;
 
@@ -609,7 +609,7 @@ async function playVideo(epNum, isRemote = false) {
 
   currentEpNum = epNum;
   updateWatchHistory(currentShowId, currentShowName, epNum);
-  updateURL(currentShowId, currentShowName, epNum); // --- ANISKIP FETCH ---
+  updateURL(currentShowId, currentShowName, epNum);
 
   resolveMalId(currentShowId, currentShowName).then((malId) => {
     if (malId) {
@@ -627,7 +627,7 @@ async function playVideo(epNum, isRemote = false) {
   }
 
   videoOverlay.classList.remove("hidden");
-  videoOverlay.innerHTML = "Buffering Stream...";
+  videoOverlay.innerHTML = "Loading Stream...";
 
   try {
     const mode = modeToggle.value;
@@ -636,7 +636,6 @@ async function playVideo(epNum, isRemote = false) {
     );
     const data = await res.json();
 
-    // NEW: If another episode was clicked while this was fetching, abort!
     if (fetchId !== currentStreamFetchId) {
       console.log("Aborted stale stream fetch for episode:", epNum);
       return;
@@ -661,26 +660,32 @@ async function playVideo(epNum, isRemote = false) {
         videoPlayer.currentTime = 0;
       }
 
-      videoOverlay.classList.add("hidden");
-
-      if (isRemote) isRemoteAction = true;
-
-      const playPromise = videoPlayer.play();
-      if (playPromise !== undefined) {
-        playPromise.catch((error) => {
-          console.warn("Autoplay blocked by browser:", error);
-          videoOverlay.innerHTML = "Click Video to Play";
-          videoOverlay.classList.remove("hidden");
-          videoWrapper.classList.add("paused"); // Ensure play button shows properly
-        });
-      }
-
       if ("mediaSession" in navigator) {
         navigator.mediaSession.metadata = new MediaMetadata({
           title: `Episode ${epNum}`,
           artist: currentShowName,
           album: "Watch Together",
         });
+      }
+
+      // Initial Buffering Hook
+      if (isSyncEnabled) {
+        videoPlayer.pause();
+        videoOverlay.innerHTML = "Waiting for friend to buffer...";
+        videoOverlay.classList.remove("hidden");
+      } else {
+        videoPlayer
+          .play()
+          .then(() => {
+            videoOverlay.classList.add("hidden");
+          })
+          .catch((error) => {
+            console.warn("Autoplay blocked by browser:", error);
+            videoOverlay.innerHTML =
+              "Browser Blocked Autoplay.<br><br><b>Click Here to Play</b>";
+            videoOverlay.classList.remove("hidden");
+            videoWrapper.classList.add("paused");
+          });
       }
     };
 
@@ -740,11 +745,24 @@ function showWatchView() {
   watchView.classList.remove("hidden");
 }
 
-// --- WebSocket Setup & Watch Party Logic ---
+// ==========================================
+// Socket.IO State Machine & Sync Protocol
+// ==========================================
 const socket = typeof io !== "undefined" ? io() : null;
-let isRemoteAction = false;
+
+// Capture native buffering states
+videoPlayer.addEventListener("waiting", () => {
+  videoPlayer.dataset.isBuffering = "true";
+});
+videoPlayer.addEventListener("playing", () => {
+  videoPlayer.dataset.isBuffering = "false";
+});
+videoPlayer.addEventListener("canplay", () => {
+  videoPlayer.dataset.isBuffering = "false";
+});
 
 if (socket) {
+  // Navigation Syncing
   socket.on("receive_search", async (data) => {
     if (!isSyncEnabled) return;
     searchInput.value = data.query;
@@ -764,15 +782,6 @@ if (socket) {
     } finally {
       loadingSpinner.classList.add("hidden");
     }
-  });
-
-  socket.on("receive_play", (data) => {
-    if (!isSyncEnabled) return;
-    isRemoteAction = true;
-    if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
-      videoPlayer.currentTime = data.time;
-    }
-    videoPlayer.play();
   });
 
   socket.on("receive_load_show", (data) => {
@@ -795,11 +804,35 @@ if (socket) {
     showSearchView();
   });
 
+  // Explicit Media Action Handlers
+  socket.on("receive_play", (data) => {
+    if (!isSyncEnabled) return;
+    isRemoteAction = true;
+    if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
+      videoPlayer.currentTime = data.time;
+    }
+
+    // Gracefully handle browser autoplay blocks on explicit plays
+    videoPlayer
+      .play()
+      .then(() => {
+        videoOverlay.classList.add("hidden");
+      })
+      .catch((e) => {
+        console.warn("Autoplay blocked:", e);
+        videoOverlay.innerHTML =
+          "Browser Blocked Autoplay.<br><br><b>Click Here to Sync</b>";
+        videoOverlay.classList.remove("hidden");
+      });
+  });
+
   socket.on("receive_pause", (data) => {
     if (!isSyncEnabled) return;
     isRemoteAction = true;
-    videoPlayer.currentTime = data.time;
     videoPlayer.pause();
+    if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
+      videoPlayer.currentTime = data.time;
+    }
   });
 
   socket.on("receive_seek", (data) => {
@@ -807,30 +840,100 @@ if (socket) {
     isRemoteAction = true;
     videoPlayer.currentTime = data.time;
   });
+
+  // Respond to Server Heartbeat
+  socket.on("request_heartbeat", () => {
+    if (!isSyncEnabled) return;
+
+    let currentStatus = watchView.classList.contains("hidden")
+      ? "browsing"
+      : "watching";
+    let vidState = "paused";
+
+    if (currentStatus === "watching") {
+      if (
+        videoPlayer.dataset.isBuffering === "true" ||
+        videoPlayer.readyState < 3
+      ) {
+        vidState = "buffering";
+      } else if (!videoPlayer.paused) {
+        vidState = "playing";
+      }
+    }
+
+    socket.emit("report_state", {
+      status: currentStatus,
+      video_state: vidState,
+      time: videoPlayer.currentTime || 0,
+      showId: currentShowId,
+      epNum: currentEpNum,
+    });
+  });
+
+  // Handle Force Load
+  socket.on("force_load", (data) => {
+    if (!isSyncEnabled) return;
+    if (currentShowId !== data.showId || currentEpNum !== data.epNum) {
+      console.log("Sync: Pulled into friend's watch party.");
+      loadEpisodes(data.showId, "Watch Party", data.epNum, true);
+    }
+  });
+
+  // Handle State Corrections
+  socket.on("sync_correction", (cmd) => {
+    if (!isSyncEnabled) return;
+
+    if (cmd.action === "pause_for_buffer") {
+      if (!videoPlayer.paused) {
+        isRemoteAction = true;
+        videoPlayer.pause();
+        videoOverlay.innerHTML = "Waiting for friend to buffer...";
+        videoOverlay.classList.remove("hidden");
+      }
+    } else if (cmd.action === "force_pause") {
+      if (!videoPlayer.paused) {
+        isRemoteAction = true;
+        videoPlayer.pause();
+      }
+    } else if (cmd.action === "pause_timeout") {
+      if (!videoPlayer.paused) {
+        isRemoteAction = true;
+        videoPlayer.pause();
+        videoOverlay.innerHTML = "Syncing... Waiting for friend to catch up.";
+        videoOverlay.classList.remove("hidden");
+
+        setTimeout(() => {
+          videoOverlay.classList.add("hidden");
+          isRemoteAction = true;
+          // Guard the automatic catch-up play as well
+          videoPlayer.play().catch((e) => {
+            console.warn("Autoplay blocked:", e);
+            videoOverlay.innerHTML =
+              "Browser Blocked Autoplay.<br><br><b>Click Here to Sync</b>";
+            videoOverlay.classList.remove("hidden");
+          });
+        }, cmd.timeout_ms);
+      }
+    } else if (cmd.action === "all_ready_play") {
+      if (videoPlayer.paused) {
+        isRemoteAction = true;
+        videoPlayer
+          .play()
+          .then(() => {
+            videoOverlay.classList.add("hidden");
+          })
+          .catch((e) => {
+            console.warn("Autoplay blocked:", e);
+            videoOverlay.innerHTML =
+              "Browser Blocked Autoplay.<br><br><b>Click Here to Start Sync</b>";
+            videoOverlay.classList.remove("hidden");
+          });
+      } else {
+        videoOverlay.classList.add("hidden");
+      }
+    }
+  });
 }
-
-// Video Player Event Listeners for Sockets
-// (Since custom controls fire these native events, sync works flawlessly!)
-videoPlayer.addEventListener("play", () => {
-  if (!isRemoteAction && isSyncEnabled && socket) {
-    socket.emit("play_action", { time: videoPlayer.currentTime });
-  }
-  isRemoteAction = false;
-});
-
-videoPlayer.addEventListener("pause", () => {
-  if (!isRemoteAction && isSyncEnabled && socket) {
-    socket.emit("pause_action", { time: videoPlayer.currentTime });
-  }
-  isRemoteAction = false;
-});
-
-videoPlayer.addEventListener("seeked", () => {
-  if (!isRemoteAction && isSyncEnabled && socket) {
-    socket.emit("seek_action", { time: videoPlayer.currentTime });
-  }
-  isRemoteAction = false;
-});
 
 // --- Jikan Schedule Integration ---
 const scheduleGrid = document.getElementById("schedule-grid");
@@ -924,9 +1027,6 @@ function renderSchedule(animeList) {
 
     card.addEventListener("click", () => {
       searchInput.value = title;
-      if (isSyncEnabled && socket) {
-        socket.emit("search_action", { query: title });
-      }
       searchForm.dispatchEvent(
         new Event("submit", { cancelable: true, bubbles: true }),
       );
@@ -1009,23 +1109,18 @@ function renderContinueWatching() {
 
 let isDraggingProgress = false;
 
-// Stop timeupdate from fighting our mouse
 progressBar.addEventListener("mousedown", () => (isDraggingProgress = true));
 progressBar.addEventListener("touchstart", () => (isDraggingProgress = true));
 
 progressBar.addEventListener("mouseup", () => (isDraggingProgress = false));
 progressBar.addEventListener("touchend", () => (isDraggingProgress = false));
 
-// Listen to the 'progress' event to map the video buffer
 videoPlayer.addEventListener("progress", () => {
   if (videoPlayer.duration > 0 && videoPlayer.buffered.length > 0) {
-    // Find the furthest buffered point
     const bufferedEnd = videoPlayer.buffered.end(
       videoPlayer.buffered.length - 1,
     );
     const bufferPercent = (bufferedEnd / videoPlayer.duration) * 100;
-
-    // Inject the variable into CSS
     progressBar.style.setProperty("--buffered-pct", `${bufferPercent}%`);
   }
 });
@@ -1036,23 +1131,18 @@ videoPlayer.addEventListener("timeupdate", () => {
 
   const currentTime = videoPlayer.currentTime;
 
-  // Only update the bar's position if the user IS NOT dragging it
   if (!isDraggingProgress) {
     const progressPercent = (currentTime / videoPlayer.duration) * 100;
     progressBar.value = progressPercent;
-    // Inject the played variable into CSS
     progressBar.style.setProperty("--played-pct", `${progressPercent}%`);
   }
 
-  // Update UI text
   timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
 
-  // --- Watch History ---
   if (currentShowId && currentEpNum && currentTime > 0) {
     localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
   }
 
-  // --- AniSkip Logic ---
   if (currentSkipTimes.length > 0) {
     const matchingSkip = currentSkipTimes.find(
       (skip) => currentTime >= skip.start && currentTime <= skip.end,
@@ -1076,14 +1166,11 @@ videoPlayer.addEventListener("timeupdate", () => {
 // 4. Seek via Custom Progress Bar
 // ==========================================
 
-// 'input' fires continuously while dragging. We update the CSS visually, but DO NOT seek the video yet to avoid stuttering.
 progressBar.addEventListener("input", (e) => {
   progressBar.style.setProperty("--played-pct", `${e.target.value}%`);
 });
 
-// 'change' fires only when the user lets go of the mouse/finger (or clicks). This is when we actually seek the video.
 progressBar.addEventListener("change", (e) => {
   const newTime = (e.target.value / 100) * videoPlayer.duration;
   videoPlayer.currentTime = newTime;
-  // (Note: Changing currentTime naturally fires the 'seeked' event when done, handling Watch Party Sync!)
 });

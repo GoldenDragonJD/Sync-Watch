@@ -2,3 +2,4 @@ flask
 flask-socketio
 requests
 anipy-api
+playit-linux-amd64

@@ -1,4 +1,5 @@
 import base64
+import time
 import urllib.parse
 
 import requests
@@ -67,7 +68,6 @@ try:
 
     if provider is not None:
         HAS_ANIPY = True
-        # Determine the actual name of what we loaded for the terminal log
         actual_name = getattr(provider.__class__, "__name__", "Unknown")
         print(f"Successfully loaded anipy-api provider: {actual_name}")
     else:
@@ -178,7 +178,6 @@ def search_anime(query, mode="sub"):
             eps_sub = "?"
             eps_dub = "?"
 
-            # Ultra-robust extraction for ID, Name, and Episode Counts
             if isinstance(res, dict):
                 _id = (
                     res.get("url")
@@ -188,8 +187,6 @@ def search_anime(query, mode="sub"):
                     or res.get("link")
                 )
                 name = res.get("name") or res.get("title") or "Unknown"
-
-                # Extract episode counts if available in the dict
                 av_eps = res.get("availableEpisodes", {})
                 if isinstance(av_eps, dict):
                     eps_sub = av_eps.get("sub", "?")
@@ -211,7 +208,6 @@ def search_anime(query, mode="sub"):
                     or "Unknown"
                 )
 
-                # Extract episode counts if available as object attributes
                 av_eps = getattr(res, "availableEpisodes", None)
                 if isinstance(av_eps, dict):
                     eps_sub = av_eps.get("sub", "?")
@@ -225,7 +221,6 @@ def search_anime(query, mode="sub"):
                     d = vars(res)
                     _id = d.get("url") or d.get("slug") or d.get("id") or d.get("link")
                     name = d.get("name") or d.get("title") or name
-
                     av_eps_d = d.get("availableEpisodes", {})
                     if isinstance(av_eps_d, dict):
                         eps_sub = av_eps_d.get("sub", "?")
@@ -245,7 +240,6 @@ def search_anime(query, mode="sub"):
                 )
                 _id = f"/category/{clean_name}"
 
-            # Base64 encode the ID
             safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8")
             safe_id = safe_id.rstrip("=")
 
@@ -272,7 +266,6 @@ def get_episodes(show_id):
         return {"sub": [], "dub": []}
 
     try:
-        # Re-add padding and decode safely
         padded_id = show_id + "=" * (-len(show_id) % 4)
         try:
             real_id = base64.urlsafe_b64decode(padded_id.encode("utf-8")).decode(
@@ -304,7 +297,6 @@ def get_stream_for_episode(show_id, episode_string, mode="sub"):
         return None
 
     try:
-        # Re-add padding and decode safely
         padded_id = show_id + "=" * (-len(show_id) % 4)
         try:
             real_id = base64.urlsafe_b64decode(padded_id.encode("utf-8")).decode(
@@ -316,7 +308,6 @@ def get_stream_for_episode(show_id, episode_string, mode="sub"):
         anime = Anime(provider, real_id, real_id, "Unknown")
         lang = LANG_DUB if mode == "dub" else LANG_SUB
 
-        # Parse episode string safely
         try:
             ep_num = float(episode_string)
             if ep_num.is_integer():
@@ -329,7 +320,6 @@ def get_stream_for_episode(show_id, episode_string, mode="sub"):
         if stream:
             return getattr(stream, "url", None)
 
-        # Fallback without quality parameter
         stream = anime.get_video(episode=ep_num, lang=lang)
         if stream:
             return getattr(stream, "url", None)
@@ -367,7 +357,6 @@ def search(anime):
     return jsonify(results)
 
 
-# Using <path:show_id> to catch IDs that might contain slashes like 'category/naruto'
 @app.route("/api/<path:show_id>/episodes")
 def show(show_id):
     results = get_episodes(show_id)
@@ -425,7 +414,137 @@ def get_schedule():
 
 
 # ==========================================
-# Socket.IO Event Handlers (Unchanged)
+# Socket.IO Event Handlers & Sync Logic
+# ==========================================
+
+clients = {}
+room_was_buffering = False
+sync_cooldown_until = 0.0  # NEW: The Heartbeat Shield timer
+
+
+@socketio.on("connect")
+def handle_connect():
+    clients[request.sid] = {
+        "status": "browsing",
+        "video_state": "paused",
+        "time": 0.0,
+        "showId": None,
+        "epNum": None,
+    }
+
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    clients.pop(request.sid, None)
+
+
+@socketio.on("report_state")
+def handle_report_state(data):
+    """Clients send this back every time the server sends a heartbeat."""
+    if request.sid in clients:
+        clients[request.sid].update(data)
+    evaluate_room_sync()
+
+
+def evaluate_room_sync():
+    """The core priority and sync logic."""
+    global room_was_buffering
+    global sync_cooldown_until
+
+    if not clients:
+        return
+
+    watching_clients = {
+        sid: data for sid, data in clients.items() if data.get("status") == "watching"
+    }
+
+    if not watching_clients:
+        return
+
+    # Priority 1: If someone is watching, pull browsing users into the show
+    if len(watching_clients) < len(clients):
+        lead = list(watching_clients.values())[0]
+        for sid, data in clients.items():
+            if data.get("status") == "browsing":
+                socketio.emit(
+                    "force_load",
+                    {
+                        "showId": lead["showId"],
+                        "epNum": lead["epNum"],
+                        "time": lead["time"],
+                    },
+                    to=sid,
+                )
+        return
+
+    # Priority 2: Buffering Check (Wait for everyone)
+    is_anyone_buffering = any(
+        c.get("video_state") == "buffering" for c in watching_clients.values()
+    )
+    if is_anyone_buffering:
+        room_was_buffering = True
+        for sid, c in watching_clients.items():
+            if c.get("video_state") == "playing":
+                socketio.emit("sync_correction", {"action": "pause_for_buffer"}, to=sid)
+        return
+
+    # Priority 2.5: The "All Ready" Unlock
+    if room_was_buffering and not is_anyone_buffering:
+        room_was_buffering = False
+        socketio.emit("sync_correction", {"action": "all_ready_play"})
+        return
+
+    # === COOLDOWN SHIELD ===
+    # If a user explicitly clicked play, pause, or seek recently,
+    # skip the strict state-matching below to give the room time to settle.
+    if time.time() < sync_cooldown_until:
+        return
+
+    # Gather states for desync checks
+    playing_clients = [
+        sid for sid, c in watching_clients.items() if c.get("video_state") == "playing"
+    ]
+    paused_clients = [
+        sid for sid, c in watching_clients.items() if c.get("video_state") == "paused"
+    ]
+
+    # Priority 3: Play/Pause Mismatch
+    if len(playing_clients) > 0 and len(paused_clients) > 0:
+        for sid in playing_clients:
+            socketio.emit("sync_correction", {"action": "force_pause"}, to=sid)
+        return
+
+    # Priority 4: >3s Desync Check (ONLY if everyone is playing!)
+    if len(watching_clients) > 1 and len(playing_clients) == len(watching_clients):
+        times = [(sid, c.get("time", 0.0)) for sid, c in watching_clients.items()]
+        times.sort(key=lambda x: x[1])
+
+        lowest_sid, lowest_time = times[0]
+        highest_sid, highest_time = times[-1]
+
+        time_diff = highest_time - lowest_time
+
+        if time_diff > 3.0:
+            socketio.emit(
+                "sync_correction",
+                {"action": "pause_timeout", "timeout_ms": int(time_diff * 1000)},
+                to=highest_sid,
+            )
+            return
+
+
+def heartbeat_loop():
+    """Sends a ping every 1 second to all clients asking for their state."""
+    while True:
+        socketio.sleep(1)
+        socketio.emit("request_heartbeat")
+
+
+socketio.start_background_task(heartbeat_loop)
+
+
+# ==========================================
+# Explicit UI and Media Sync Broadcasts
 # ==========================================
 
 
@@ -434,34 +553,44 @@ def handle_search_sync(data):
     emit("receive_search", data, broadcast=True, include_self=False)
 
 
-@socketio.on("play_action")
-def handle_play_sync(data):
-    emit("receive_play", data, broadcast=True, include_self=False)
-
-
-@socketio.on("pause_action")
-def handle_pause_sync(data):
-    emit("receive_pause", data, broadcast=True, include_self=False)
-
-
-@socketio.on("seek_action")
-def handle_seek_sync(data):
-    emit("receive_seek", data, broadcast=True, include_self=False)
-
-
 @socketio.on("load_show_action")
 def handle_load_show_sync(data):
+    global sync_cooldown_until
+    sync_cooldown_until = time.time() + 5.0
     emit("receive_load_show", data, broadcast=True, include_self=False)
 
 
 @socketio.on("load_episode_action")
 def handle_load_episode_sync(data):
+    global sync_cooldown_until
+    sync_cooldown_until = time.time() + 5.0
     emit("receive_load_episode", data, broadcast=True, include_self=False)
 
 
 @socketio.on("back_action")
 def handle_back_sync():
     emit("receive_back", broadcast=True, include_self=False)
+
+
+@socketio.on("play_action")
+def handle_play_sync(data):
+    global sync_cooldown_until
+    sync_cooldown_until = time.time() + 5.0
+    emit("receive_play", data, broadcast=True, include_self=False)
+
+
+@socketio.on("pause_action")
+def handle_pause_sync(data):
+    global sync_cooldown_until
+    sync_cooldown_until = time.time() + 5.0
+    emit("receive_pause", data, broadcast=True, include_self=False)
+
+
+@socketio.on("seek_action")
+def handle_seek_sync(data):
+    global sync_cooldown_until
+    sync_cooldown_until = time.time() + 5.0
+    emit("receive_seek", data, broadcast=True, include_self=False)
 
 
 if __name__ == "__main__":
