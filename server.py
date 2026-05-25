@@ -447,7 +447,6 @@ def handle_report_state(data):
 
 
 def evaluate_room_sync():
-    """The core priority and sync logic."""
     global room_was_buffering
     global sync_cooldown_until
 
@@ -461,7 +460,7 @@ def evaluate_room_sync():
     if not watching_clients:
         return
 
-    # Priority 1: If someone is watching, pull browsing users into the show
+    # Priority 1: Sync browsing users into active show
     if len(watching_clients) < len(clients):
         lead = list(watching_clients.values())[0]
         for sid, data in clients.items():
@@ -477,10 +476,11 @@ def evaluate_room_sync():
                 )
         return
 
-    # Priority 2: Buffering Check (Wait for everyone)
+    # Priority 2: Buffering handling
     is_anyone_buffering = any(
         c.get("video_state") == "buffering" for c in watching_clients.values()
     )
+
     if is_anyone_buffering:
         room_was_buffering = True
         for sid, c in watching_clients.items():
@@ -488,19 +488,16 @@ def evaluate_room_sync():
                 socketio.emit("sync_correction", {"action": "pause_for_buffer"}, to=sid)
         return
 
-    # Priority 2.5: The "All Ready" Unlock
     if room_was_buffering and not is_anyone_buffering:
         room_was_buffering = False
         socketio.emit("sync_correction", {"action": "all_ready_play"})
         return
 
     # === COOLDOWN SHIELD ===
-    # If a user explicitly clicked play, pause, or seek recently,
-    # skip the strict state-matching below to give the room time to settle.
     if time.time() < sync_cooldown_until:
         return
 
-    # Gather states for desync checks
+    # Gather states
     playing_clients = [
         sid for sid, c in watching_clients.items() if c.get("video_state") == "playing"
     ]
@@ -508,13 +505,14 @@ def evaluate_room_sync():
         sid for sid, c in watching_clients.items() if c.get("video_state") == "paused"
     ]
 
-    # Priority 3: Play/Pause Mismatch
+    # 🔥 FIX: DO NOT FORCE PAUSE ON MINOR MISMATCH
+    # Only act if LARGE disagreement persists
+
     if len(playing_clients) > 0 and len(paused_clients) > 0:
-        for sid in playing_clients:
-            socketio.emit("sync_correction", {"action": "force_pause"}, to=sid)
+        # Wait for natural resolution instead of forcing pause
         return
 
-    # Priority 4: >3s Desync Check (ONLY if everyone is playing!)
+    # Priority 4: Time desync correction ONLY (no pause spam)
     if len(watching_clients) > 1 and len(playing_clients) == len(watching_clients):
         times = [(sid, c.get("time", 0.0)) for sid, c in watching_clients.items()]
         times.sort(key=lambda x: x[1])
@@ -525,9 +523,10 @@ def evaluate_room_sync():
         time_diff = highest_time - lowest_time
 
         if time_diff > 3.0:
+            # 🔥 FIX: Instead of pausing, gently resync time
             socketio.emit(
                 "sync_correction",
-                {"action": "pause_timeout", "timeout_ms": int(time_diff * 1000)},
+                {"action": "resync_time", "target_time": lowest_time},
                 to=highest_sid,
             )
             return

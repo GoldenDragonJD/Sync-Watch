@@ -890,11 +890,6 @@ if (socket) {
         videoOverlay.innerHTML = "Waiting for friend to buffer...";
         videoOverlay.classList.remove("hidden");
       }
-    } else if (cmd.action === "force_pause") {
-      if (!videoPlayer.paused) {
-        isRemoteAction = true;
-        videoPlayer.pause();
-      }
     } else if (cmd.action === "pause_timeout") {
       if (!videoPlayer.paused) {
         isRemoteAction = true;
@@ -928,6 +923,9 @@ if (socket) {
               "Browser Blocked Autoplay.<br><br><b>Click Here to Start Sync</b>";
             videoOverlay.classList.remove("hidden");
           });
+      } else if (cmd.action === "resync_time") {
+        isRemoteAction = true;
+        videoPlayer.currentTime = data.target_time;
       } else {
         videoOverlay.classList.add("hidden");
       }
