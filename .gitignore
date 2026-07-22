@@ -1,3 +1,4 @@
 venv
 server.sh
 playit-linux-amd64
+seasonal_cache.db

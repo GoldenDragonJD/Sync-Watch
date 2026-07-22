@@ -44,7 +44,7 @@ let currentSkipTimes = [];
 let activeSkip = null;
 let currentStreamFetchId = 0;
 let idleTimer;
-let isRemoteAction = false; // Prevents recursive Socket.IO echo loops
+let isRemoteAction = false;
 
 // --- Sync Toggle State ---
 const syncToggle = document.getElementById("sync-toggle");
@@ -100,7 +100,6 @@ videoPlayer.addEventListener("play", () => {
   videoWrapper.classList.remove("paused");
   showUIAndResetTimer();
 
-  // If this play was triggered by the server, consume the flag and don't echo
   if (isRemoteAction) {
     isRemoteAction = false;
     return;
@@ -363,7 +362,6 @@ async function resolveMalId(showId, showName) {
     return parseInt(showId, 10);
   }
 
-  console.log("ID is not a MAL integer. Searching Jikan for MAL ID...");
   try {
     const cleanName = showName.replace(/\(Dub\)|\(Sub\)/gi, "").trim();
     const res = await fetch(
@@ -372,15 +370,11 @@ async function resolveMalId(showId, showName) {
     const json = await res.json();
 
     if (json.data && json.data.length > 0) {
-      const malId = json.data[0].mal_id;
-      console.log(`Successfully mapped "${showName}" to MAL ID: ${malId}`);
-      return malId;
+      return json.data[0].mal_id;
     }
   } catch (err) {
     console.warn("Failed to resolve MAL ID via Jikan:", err);
   }
-
-  console.warn(`Could not resolve a MAL ID for ${showName}`);
   return null;
 }
 
@@ -403,11 +397,8 @@ async function fetchSkipTimes(malId, epNum) {
         start: r.interval.startTime,
         end: r.interval.endTime,
       }));
-      console.log("Loaded skip times:", currentSkipTimes);
     }
-  } catch (err) {
-    console.warn("Failed to fetch skip times or no skips available:", err);
-  }
+  } catch (err) {}
 }
 
 function showSkipButton(skipData) {
@@ -668,7 +659,6 @@ async function playVideo(epNum, isRemote = false) {
         });
       }
 
-      // Initial Buffering Hook
       if (isSyncEnabled) {
         videoPlayer.pause();
         videoOverlay.innerHTML = "Waiting for friend to buffer...";
@@ -750,7 +740,6 @@ function showWatchView() {
 // ==========================================
 const socket = typeof io !== "undefined" ? io() : null;
 
-// Capture native buffering states
 videoPlayer.addEventListener("waiting", () => {
   videoPlayer.dataset.isBuffering = "true";
 });
@@ -762,7 +751,6 @@ videoPlayer.addEventListener("canplay", () => {
 });
 
 if (socket) {
-  // Navigation Syncing
   socket.on("receive_search", async (data) => {
     if (!isSyncEnabled) return;
     searchInput.value = data.query;
@@ -804,7 +792,6 @@ if (socket) {
     showSearchView();
   });
 
-  // Explicit Media Action Handlers
   socket.on("receive_play", (data) => {
     if (!isSyncEnabled) return;
     isRemoteAction = true;
@@ -812,7 +799,6 @@ if (socket) {
       videoPlayer.currentTime = data.time;
     }
 
-    // Gracefully handle browser autoplay blocks on explicit plays
     videoPlayer
       .play()
       .then(() => {
@@ -841,7 +827,6 @@ if (socket) {
     videoPlayer.currentTime = data.time;
   });
 
-  // Respond to Server Heartbeat
   socket.on("request_heartbeat", () => {
     if (!isSyncEnabled) return;
 
@@ -870,7 +855,6 @@ if (socket) {
     });
   });
 
-  // Handle Force Load
   socket.on("force_load", (data) => {
     if (!isSyncEnabled) return;
     if (currentShowId !== data.showId || currentEpNum !== data.epNum) {
@@ -879,7 +863,6 @@ if (socket) {
     }
   });
 
-  // Handle State Corrections
   socket.on("sync_correction", (cmd) => {
     if (!isSyncEnabled) return;
 
@@ -900,7 +883,6 @@ if (socket) {
         setTimeout(() => {
           videoOverlay.classList.add("hidden");
           isRemoteAction = true;
-          // Guard the automatic catch-up play as well
           videoPlayer.play().catch((e) => {
             console.warn("Autoplay blocked:", e);
             videoOverlay.innerHTML =
@@ -925,7 +907,7 @@ if (socket) {
           });
       } else if (cmd.action === "resync_time") {
         isRemoteAction = true;
-        videoPlayer.currentTime = data.target_time;
+        videoPlayer.currentTime = cmd.target_time;
       } else {
         videoOverlay.classList.add("hidden");
       }
@@ -933,104 +915,200 @@ if (socket) {
   });
 }
 
-// --- Jikan Schedule Integration ---
+// ==========================================
+// anipy-api Seasonal Releases Integration
+// ==========================================
 const scheduleGrid = document.getElementById("schedule-grid");
 const scheduleTitle = document.getElementById("schedule-title");
 const scheduleControls = document.getElementById("schedule-controls");
 
-const daysOfWeek = [
-  "Sunday",
-  "Monday",
-  "Tuesday",
-  "Wednesday",
-  "Thursday",
-  "Friday",
-  "Saturday",
-];
+function getCurrentSeasonInfo() {
+  const now = new Date();
+  const month = now.getMonth(); // 0 (Jan) to 11 (Dec)
+  const year = now.getFullYear();
 
-document.addEventListener("DOMContentLoaded", () => {
-  if (scheduleControls) buildDayFilters();
-});
+  let season = "WINTER";
+  if (month >= 2 && month <= 4) season = "SPRING"; // March to May
+  else if (month >= 5 && month <= 7) season = "SUMMER"; // June to August
+  else if (month >= 8 && month <= 10) season = "FALL"; // September to November
 
-function buildDayFilters() {
-  scheduleControls.innerHTML = "";
-  const todayIndex = new Date().getDay();
-
-  daysOfWeek.forEach((day, index) => {
-    const btn = document.createElement("button");
-    btn.className = `ep-btn ${index === todayIndex ? "active" : ""}`;
-    btn.textContent = day.substring(0, 3);
-    btn.style.padding = "0.5rem 1rem";
-    btn.style.minWidth = "60px";
-
-    btn.addEventListener("click", () => {
-      document
-        .querySelectorAll("#schedule-controls .ep-btn")
-        .forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      fetchSchedule(day.toLowerCase(), `${day}'s Releases`);
-    });
-    scheduleControls.appendChild(btn);
-  });
-
-  const todayName = daysOfWeek[todayIndex];
-  fetchSchedule(todayName.toLowerCase(), `Today's Releases (${todayName})`);
+  return { season, year };
 }
 
-async function fetchSchedule(dayName, titleLabel) {
+document.addEventListener("DOMContentLoaded", () => {
+  if (scheduleControls) {
+    buildSeasonalFilters();
+  }
+});
+
+function buildSeasonalFilters() {
+  // FIX: Define 'current' so the UI knows what the current season and year are
+  const current = getCurrentSeasonInfo();
+
+  scheduleControls.innerHTML = `
+    <select id="season-select" class="ep-btn" style="padding: 0.5rem; background: var(--bg-card); color: var(--text-light); border: 1px solid var(--border-color);">
+      <option value="WINTER" ${current.season === "WINTER" ? "selected" : ""}>Winter</option>
+      <option value="SPRING" ${current.season === "SPRING" ? "selected" : ""}>Spring</option>
+      <option value="SUMMER" ${current.season === "SUMMER" ? "selected" : ""}>Summer</option>
+      <option value="FALL" ${current.season === "FALL" ? "selected" : ""}>Fall</option>
+    </select>
+    <select id="year-select" class="ep-btn" style="padding: 0.5rem; background: var(--bg-card); color: var(--text-light); border: 1px solid var(--border-color);">
+      <option value="${current.year + 1}">${current.year + 1}</option>
+      <option value="${current.year}" selected>${current.year}</option>
+      <option value="${current.year - 1}">${current.year - 1}</option>
+      <option value="${current.year - 2}">${current.year - 2}</option>
+    </select>
+    <button id="seasonal-search-btn" class="ep-btn active" style="padding: 0.5rem 1rem;">Load Season</button>
+    <button id="force-update-btn" class="ep-btn" style="padding: 0.5rem 1rem; background: var(--primary); color: white;">Force Update</button>
+  `;
+
+  document.getElementById("seasonal-search-btn").addEventListener("click", () => {
+    const year = document.getElementById("year-select").value;
+    const season = document.getElementById("season-select").value;
+    fetchSeasonal(year, season);
+  });
+
+  document.getElementById("force-update-btn").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    const originalText = e.target.textContent;
+    e.target.textContent = "Updating...";
+    try {
+      const res = await fetch("/api/seasonal/force_update", { method: "POST" });
+      if (res.ok) {
+        e.target.textContent = "Started!";
+      } else {
+        throw new Error("Update failed");
+      }
+    } catch (err) {
+      console.error(err);
+      e.target.textContent = "Error";
+    } finally {
+      setTimeout(() => {
+        e.target.textContent = originalText;
+        e.target.disabled = false;
+      }, 3000);
+    }
+  });
+
+  // FIX: Automatically load the calculated current season on first load
+  fetchSeasonal(current.year, current.season);
+}
+
+async function fetchSeasonal(year, season) {
   if (!scheduleTitle || !scheduleGrid) return;
 
-  scheduleTitle.textContent = "Loading...";
+  scheduleTitle.textContent = `Loading ${season} ${year}...`;
   scheduleGrid.innerHTML = "";
 
   try {
-    const res = await fetch(`/api/schedule?day=${dayName}`);
+    const res = await fetch(`/api/seasonal?year=${year}&season=${season}`);
     const json = await res.json();
 
     if (json.data && json.data.length > 0) {
-      scheduleTitle.textContent = titleLabel;
-      renderSchedule(json.data);
+      let animeList = json.data;
+
+      // --- TRACKER LOGIC: Diff current fetch against local storage ---
+      const trackerKey = `season_tracker_${season}_${year}`;
+      let tracker = JSON.parse(localStorage.getItem(trackerKey) || "{}");
+      let updatedTracker = {};
+
+      animeList = animeList.map(anime => {
+        const id = anime._id || anime.name;
+        // Parse ints safely, default to 0 if API returns "?" or undefined
+        const subCount = parseInt(anime.availableEpisodes?.sub) || 0;
+        const dubCount = parseInt(anime.availableEpisodes?.dub) || 0;
+
+        let isNew = false;
+
+        // If we have seen this show before, check if counts increased
+        if (tracker[id]) {
+           if (subCount > tracker[id].sub || dubCount > tracker[id].dub) {
+               isNew = true;
+           } else if (tracker[id].isNew) {
+               isNew = true;
+           }
+        }
+
+        // Build the new snapshot to save
+        updatedTracker[id] = { sub: subCount, dub: dubCount, isNew: isNew };
+
+        return { ...anime, isNew };
+      });
+
+      // Save the updated snapshot
+      localStorage.setItem(trackerKey, JSON.stringify(updatedTracker));
+
+      // Sort array: Push 'isNew = true' items to the top
+      animeList.sort((a, b) => (b.isNew === true ? 1 : 0) - (a.isNew === true ? 1 : 0));
+
+      scheduleTitle.textContent = `${season.charAt(0).toUpperCase() + season.slice(1).toLowerCase()} ${year} Releases`;
+      renderSeasonal(animeList, trackerKey);
     } else {
-      scheduleTitle.textContent = titleLabel;
-      scheduleGrid.innerHTML = "<p>No releases found for this day.</p>";
+      scheduleTitle.textContent = `${season} ${year}`;
+      scheduleGrid.innerHTML = "<p>No releases found for this season.</p>";
     }
   } catch (err) {
-    console.error("Failed to load schedule", err);
-    scheduleTitle.textContent = "Error Loading Schedule";
+    console.error("Failed to load seasonal data", err);
+    scheduleTitle.textContent = "Error Loading Season";
   }
 }
 
-function renderSchedule(animeList) {
+function renderSeasonal(animeList, trackerKey) {
   scheduleGrid.innerHTML = "";
 
   animeList.forEach((anime) => {
     const card = document.createElement("div");
     card.className = "card";
 
-    const imageUrl = anime.images?.jpg?.image_url || "";
-    const title = anime.title_english || anime.title || "Unknown Title";
-    const score = anime.score ? `★ ${anime.score}` : "Unrated";
+    const title = anime.name || "Unknown Title";
+
+    // Create a NEW badge if the tracker flagged it
+    const badgeHtml = anime.isNew
+      ? `<span class="new-badge" style="background: var(--primary); color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; margin-left: 8px;">NEW</span>`
+      : "";
+
+    // FIX: Remove the falsy trap. Explicitly check for undefined, null, and "?"
+    const subVal = anime.availableEpisodes?.sub;
+    const dubVal = anime.availableEpisodes?.dub;
+
+    const subCount = (subVal !== undefined && subVal !== null && subVal !== "?") ? subVal : "-";
+    const dubCount = (dubVal !== undefined && dubVal !== null && dubVal !== "?") ? dubVal : "-";
 
     card.innerHTML = `
-      <div style="display: flex; gap: 1rem; align-items: center;">
-          <img src="${imageUrl}" alt="${title}" style="width: 60px; height: 85px; border-radius: 8px; object-fit: cover;">
-          <div>
-              <h4 style="margin-bottom: 0.3rem; font-size: 1rem;">${title}</h4>
-              <p style="color: var(--primary); font-weight: bold; font-size: 0.9rem;">
-                  ${score}
-              </p>
-          </div>
+      <div style="padding: 0.5rem;">
+          <h4 style="margin-bottom: 0.3rem; font-size: 1rem; display: flex; align-items: center; justify-content: space-between;">
+             <span style="flex: 1;">${title}</span>
+             <span class="badge-container">${badgeHtml}</span>
+          </h4>
+          <p class="ep-count-text" style="color: var(--primary); font-weight: bold; font-size: 0.85rem;">
+              Sub: ${subCount} | Dub: ${dubCount}
+          </p>
       </div>
     `;
 
     card.addEventListener("click", () => {
-      searchInput.value = title;
-      searchForm.dispatchEvent(
-        new Event("submit", { cancelable: true, bubbles: true }),
-      );
+      // Clear the "NEW" status in local storage when the user clicks the card
+      let tracker = JSON.parse(localStorage.getItem(trackerKey) || "{}");
+      const id = anime._id || anime.name;
+      if (tracker[id]) {
+          tracker[id].isNew = false;
+          localStorage.setItem(trackerKey, JSON.stringify(tracker));
+      }
+      const badge = card.querySelector('.new-badge');
+      if (badge) badge.remove();
+
+      // Load episode or search
+      if (anime._id) {
+          loadEpisodes(anime._id, title, 1);
+      } else {
+          searchInput.value = title;
+          searchForm.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+      }
     });
 
     scheduleGrid.appendChild(card);
+
+
   });
 }
 

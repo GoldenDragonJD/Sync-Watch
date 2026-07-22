@@ -1,8 +1,11 @@
 import base64
 import time
 import urllib.parse
-
 import requests
+import sqlite3
+import threading
+import json
+import datetime
 from flask import Flask, Response, jsonify, request, send_file
 from flask_socketio import SocketIO, emit
 
@@ -26,42 +29,35 @@ try:
     except ImportError:
         pass
 
-    from anipy_api.provider import list_providers
+    # Import Filters and Season for the new seasonal routing
+    from anipy_api.provider import get_provider, list_providers, Filters, Season
 
-    available_providers = list(list_providers())
+    # 1: Attempt to load AllAnime natively via the official string method
+    try:
+        provider = get_provider("allanime")
+    except Exception:
+        pass
 
-    # FIX 1: Aggressively hunt for AllAnime by checking the underlying Python Module and Class names
-    for p_class in available_providers:
-        c_name = getattr(p_class, "__name__", "").lower()
-        m_name = getattr(p_class, "__module__", "").lower()
-
-        if "allanime" in c_name or "allanime" in m_name:
-            provider = p_class()
-            break
-
-    # FIX 2: If AllAnime is broken/missing, fallback to AnimeKai but forcefully spoof AJAX headers
+    # 2: If AllAnime is broken/missing, fallback to AnimeKai using get_provider
     if provider is None:
-        for p_class in available_providers:
-            c_name = getattr(p_class, "__name__", "").lower()
-            m_name = getattr(p_class, "__module__", "").lower()
+        try:
+            provider = get_provider("animekai")
 
-            if "animekai" in c_name or "animekai" in m_name:
-                provider = p_class()
-                # AnimeKai strictly requires these AJAX headers to bypass the 403 Forbidden block
-                if hasattr(provider, "session"):
-                    provider.session.headers.update(
-                        {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                            "Accept": "application/json, text/javascript, */*; q=0.01",
-                            "X-Requested-With": "XMLHttpRequest",
-                            "Referer": "https://animekai.to/",
-                        }
-                    )
-                break
+            if hasattr(provider, "session"):
+                provider.session.headers.update(
+                    {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": "https://animekai.to/",
+                    }
+                )
+        except Exception:
+            pass
 
-    # Failsafe
-    if provider is None and available_providers:
-        for p_class in available_providers:
+    # 3: Failsafe loop (just grab the first working non-native provider)
+    if provider is None:
+        for p_class in list_providers():
             if "native" not in getattr(p_class, "__name__", "").lower():
                 provider = p_class()
                 break
@@ -84,11 +80,9 @@ except Exception as e:
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# General headers for bypass if needed
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 }
-
 
 @app.route("/proxy")
 def proxy():
@@ -96,20 +90,17 @@ def proxy():
     if not target_url:
         return "No URL provided", 400
 
-    # FIX: Added the specific Referer back so the video server allows the connection!
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://allmanga.to",
     }
 
-    # Pass the seeking header to the target
     range_header = request.headers.get("Range", None)
     if range_header:
         headers["Range"] = range_header
 
     req = requests.get(target_url, headers=headers, stream=True)
 
-    # 1. Handle HLS Playlist (.m3u8) Rewriting for CORS bypassing
     if (
         ".m3u8" in target_url
         or "mpegurl" in req.headers.get("Content-Type", "").lower()
@@ -131,7 +122,6 @@ def proxy():
 
         return Response("\n".join(new_lines), mimetype="application/vnd.apple.mpegurl")
 
-    # 2. Handle Video Data (Chunks or MP4)
     def generate():
         for chunk in req.iter_content(chunk_size=1024 * 1024):
             if chunk:
@@ -151,9 +141,8 @@ def proxy():
 
 
 # ==========================================
-# New Scraping Logic using anipy-api
+# anipy-api Logic Helpers
 # ==========================================
-
 
 def search_anime(query, mode="sub"):
     if not HAS_ANIPY or not provider:
@@ -252,9 +241,6 @@ def search_anime(query, mode="sub"):
                 }
             )
 
-        if not formatted_results:
-            print("WARNING: Provider returned an empty list for this query.")
-
         return formatted_results
     except Exception as e:
         print(f"Search Error: {e}")
@@ -334,21 +320,17 @@ def get_stream_for_episode(show_id, episode_string, mode="sub"):
 # Routes
 # ==========================================
 
-
 @app.route("/")
 def hello_world():
     return send_file("Public/Static/index.html", mimetype="text/html")
-
 
 @app.route("/style")
 def style():
     return send_file("Public/Static/style.css", mimetype="text/css")
 
-
 @app.route("/logic")
 def logic():
     return send_file("Public/Static/logic.js", mimetype="text/javascript")
-
 
 @app.route("/api/search/<path:anime>")
 def search(anime):
@@ -356,32 +338,10 @@ def search(anime):
     results = search_anime(anime, mode)
     return jsonify(results)
 
-
 @app.route("/api/<path:show_id>/episodes")
 def show(show_id):
     results = get_episodes(show_id)
     return jsonify(results)
-
-
-@app.route("/api/embed/<path:show_id>/<episode_string>")
-def embed(show_id, episode_string):
-    mode = request.args.get("mode", "sub")
-    stream_url = get_stream_for_episode(show_id, episode_string, mode)
-
-    if stream_url:
-        return jsonify(
-            {
-                "data": {
-                    "episode": {
-                        "sourceUrls": [
-                            {"sourceName": "anipy-cli GoGo", "sourceUrl": stream_url}
-                        ]
-                    }
-                }
-            }
-        )
-    return jsonify({"error": "No embed found"}), 404
-
 
 @app.route("/api/stream/<path:show_id>/<episode_string>")
 def get_stream(show_id, episode_string):
@@ -396,20 +356,166 @@ def get_stream(show_id, episode_string):
         ), 500
 
 
-@app.route("/api/schedule")
-def get_schedule():
-    day = request.args.get("day")
-    jikan_url = "https://api.jikan.moe/v4/schedules"
-    if day:
-        jikan_url += f"?filter={day.lower()}&sfw=false"
+def get_current_season():
+    now = datetime.datetime.now()
+    month = now.month
+    year = now.year
+    if 3 <= month <= 5:
+        season = "SPRING"
+    elif 6 <= month <= 8:
+        season = "SUMMER"
+    elif 9 <= month <= 11:
+        season = "FALL"
+    else:
+        season = "WINTER"
+    return year, season
+
+def init_db():
+    conn = sqlite3.connect("seasonal_cache.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS seasonal_cache
+                 (year INTEGER, season TEXT, data TEXT, last_updated REAL,
+                 PRIMARY KEY (year, season))''')
+    conn.commit()
+    conn.close()
+
+update_event = threading.Event()
+
+def update_current_season_loop():
+    while True:
+        update_event.clear()
+        try:
+            if not HAS_ANIPY or not provider:
+                time.sleep(60)
+                continue
+                
+            year, season_str = get_current_season()
+            season_enum = getattr(Season, season_str, Season.SUMMER)
+            filters = Filters(year=year, season=season_enum)
+            
+            seasonal_results = provider.get_search("", filters=filters)
+            formatted_results = []
+            
+            if seasonal_results:
+                for res in seasonal_results:
+                    d = res if isinstance(res, dict) else vars(res) if hasattr(res, "__dict__") else {}
+                    _id = (
+                        getattr(res, "url", d.get("url")) or
+                        getattr(res, "slug", d.get("slug")) or
+                        getattr(res, "id", d.get("id")) or
+                        getattr(res, "identifier", d.get("identifier")) or
+                        getattr(res, "link", d.get("link"))
+                    )
+                    name = getattr(res, "name", d.get("name")) or getattr(res, "title", d.get("title")) or "Unknown"
+                    if not _id:
+                        continue
+                        
+                    safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8").rstrip("=")
+                    
+                    try:
+                        eps_data = get_episodes(safe_id)
+                    except Exception as e:
+                        print(f"Error fetching episodes for {_id}: {e}")
+                        eps_data = {"sub": [], "dub": []}
+                        
+                    sub_count = len(eps_data.get("sub", []))
+                    dub_count = len(eps_data.get("dub", []))
+                    
+                    formatted_results.append({
+                        "_id": safe_id,
+                        "name": str(name),
+                        "availableEpisodes": {"sub": str(sub_count), "dub": str(dub_count)}
+                    })
+            
+            if formatted_results:
+                conn = sqlite3.connect("seasonal_cache.db")
+                c = conn.cursor()
+                c.execute("INSERT OR REPLACE INTO seasonal_cache (year, season, data, last_updated) VALUES (?, ?, ?, ?)",
+                          (year, season_str, json.dumps(formatted_results), time.time()))
+                conn.commit()
+                conn.close()
+                print(f"Successfully cached {len(formatted_results)} seasonal anime for {season_str} {year}.")
+                
+        except Exception as e:
+            print(f"Error in background season updater: {e}")
+            
+        update_event.wait(3600)
+
+@app.route("/api/seasonal/force_update", methods=["POST"])
+def force_update_season():
+    update_event.set()
+    return jsonify({"status": "success", "message": "Update triggered"})
+
+@app.route("/api/seasonal")
+def get_seasonal():
+    if not HAS_ANIPY or not provider:
+        return jsonify({"error": "anipy-api provider not loaded"}), 500
+
+    req_year = request.args.get("year", type=int)
+    req_season = request.args.get("season", "").upper()
+
+    curr_year, curr_season = get_current_season()
+    if not req_year:
+        req_year = curr_year
+    if not req_season:
+        req_season = curr_season
 
     try:
-        response = requests.get(jikan_url)
-        if response.status_code == 200:
-            return jsonify(response.json())
-        else:
-            return jsonify({"error": "Failed to fetch schedule from Jikan"}), 500
+        conn = sqlite3.connect("seasonal_cache.db")
+        c = conn.cursor()
+        c.execute("SELECT data FROM seasonal_cache WHERE year=? AND season=?", (req_year, req_season))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return jsonify({"data": json.loads(row[0])})
     except Exception as e:
+        print(f"Cache read error: {e}")
+
+    try:
+        season_enum = getattr(Season, req_season, Season.SUMMER)
+        filters = Filters(year=req_year, season=season_enum)
+
+        seasonal_results = provider.get_search("", filters=filters)
+
+        formatted_results = []
+        if seasonal_results:
+            for res in seasonal_results:
+                d = res if isinstance(res, dict) else vars(res) if hasattr(res, "__dict__") else {}
+                _id = (
+                    getattr(res, "url", d.get("url")) or
+                    getattr(res, "slug", d.get("slug")) or
+                    getattr(res, "id", d.get("id")) or
+                    getattr(res, "identifier", d.get("identifier")) or
+                    getattr(res, "link", d.get("link"))
+                )
+                name = getattr(res, "name", d.get("name")) or getattr(res, "title", d.get("title")) or "Unknown"
+
+                if not _id:
+                    continue
+
+                av_eps = getattr(res, "availableEpisodes", d.get("availableEpisodes", {}))
+                if not isinstance(av_eps, dict):
+                    av_eps = getattr(res, "available_episodes", d.get("available_episodes", {}))
+                if not isinstance(av_eps, dict):
+                    av_eps = {}
+
+                fallback_ep = getattr(res, "episodes", getattr(res, "episode", getattr(res, "episode_count", d.get("episodes", "?"))))
+
+                eps_sub = av_eps.get("sub", fallback_ep)
+                eps_dub = av_eps.get("dub", "?")
+
+                safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8").rstrip("=")
+
+                formatted_results.append({
+                    "_id": safe_id,
+                    "name": str(name),
+                    "availableEpisodes": {"sub": str(eps_sub), "dub": str(eps_dub)}
+                })
+
+        return jsonify({"data": formatted_results})
+
+    except Exception as e:
+        print(f"Seasonal Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -419,8 +525,7 @@ def get_schedule():
 
 clients = {}
 room_was_buffering = False
-sync_cooldown_until = 0.0  # NEW: The Heartbeat Shield timer
-
+sync_cooldown_until = 0.0
 
 @socketio.on("connect")
 def handle_connect():
@@ -432,19 +537,15 @@ def handle_connect():
         "epNum": None,
     }
 
-
 @socketio.on("disconnect")
 def handle_disconnect():
     clients.pop(request.sid, None)
 
-
 @socketio.on("report_state")
 def handle_report_state(data):
-    """Clients send this back every time the server sends a heartbeat."""
     if request.sid in clients:
         clients[request.sid].update(data)
     evaluate_room_sync()
-
 
 def evaluate_room_sync():
     global room_was_buffering
@@ -497,7 +598,6 @@ def evaluate_room_sync():
     if time.time() < sync_cooldown_until:
         return
 
-    # Gather states
     playing_clients = [
         sid for sid, c in watching_clients.items() if c.get("video_state") == "playing"
     ]
@@ -505,14 +605,10 @@ def evaluate_room_sync():
         sid for sid, c in watching_clients.items() if c.get("video_state") == "paused"
     ]
 
-    # 🔥 FIX: DO NOT FORCE PAUSE ON MINOR MISMATCH
-    # Only act if LARGE disagreement persists
-
     if len(playing_clients) > 0 and len(paused_clients) > 0:
-        # Wait for natural resolution instead of forcing pause
         return
 
-    # Priority 4: Time desync correction ONLY (no pause spam)
+    # Priority 4: Time desync correction
     if len(watching_clients) > 1 and len(playing_clients) == len(watching_clients):
         times = [(sid, c.get("time", 0.0)) for sid, c in watching_clients.items()]
         times.sort(key=lambda x: x[1])
@@ -523,7 +619,6 @@ def evaluate_room_sync():
         time_diff = highest_time - lowest_time
 
         if time_diff > 3.0:
-            # 🔥 FIX: Instead of pausing, gently resync time
             socketio.emit(
                 "sync_correction",
                 {"action": "resync_time", "target_time": lowest_time},
@@ -531,26 +626,16 @@ def evaluate_room_sync():
             )
             return
 
-
 def heartbeat_loop():
-    """Sends a ping every 1 second to all clients asking for their state."""
     while True:
         socketio.sleep(1)
         socketio.emit("request_heartbeat")
 
-
 socketio.start_background_task(heartbeat_loop)
-
-
-# ==========================================
-# Explicit UI and Media Sync Broadcasts
-# ==========================================
-
 
 @socketio.on("search_action")
 def handle_search_sync(data):
     emit("receive_search", data, broadcast=True, include_self=False)
-
 
 @socketio.on("load_show_action")
 def handle_load_show_sync(data):
@@ -558,18 +643,15 @@ def handle_load_show_sync(data):
     sync_cooldown_until = time.time() + 5.0
     emit("receive_load_show", data, broadcast=True, include_self=False)
 
-
 @socketio.on("load_episode_action")
 def handle_load_episode_sync(data):
     global sync_cooldown_until
     sync_cooldown_until = time.time() + 5.0
     emit("receive_load_episode", data, broadcast=True, include_self=False)
 
-
 @socketio.on("back_action")
 def handle_back_sync():
     emit("receive_back", broadcast=True, include_self=False)
-
 
 @socketio.on("play_action")
 def handle_play_sync(data):
@@ -577,13 +659,11 @@ def handle_play_sync(data):
     sync_cooldown_until = time.time() + 5.0
     emit("receive_play", data, broadcast=True, include_self=False)
 
-
 @socketio.on("pause_action")
 def handle_pause_sync(data):
     global sync_cooldown_until
     sync_cooldown_until = time.time() + 5.0
     emit("receive_pause", data, broadcast=True, include_self=False)
-
 
 @socketio.on("seek_action")
 def handle_seek_sync(data):
@@ -591,6 +671,7 @@ def handle_seek_sync(data):
     sync_cooldown_until = time.time() + 5.0
     emit("receive_seek", data, broadcast=True, include_self=False)
 
-
 if __name__ == "__main__":
+    init_db()
+    threading.Thread(target=update_current_season_loop, daemon=True).start()
     socketio.run(app, debug=True, host="0.0.0.0", port=5000)
