@@ -87,13 +87,17 @@ HEADERS = {
 @app.route("/proxy")
 def proxy():
     target_url = request.args.get("url")
+    referrer = request.args.get("ref")
     if not target_url:
         return "No URL provided", 400
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://allmanga.to",
     }
+    if referrer:
+        headers["Referer"] = referrer
+    else:
+        headers["Referer"] = "https://allmanga.to"
 
     range_header = request.headers.get("Range", None)
     if range_header:
@@ -118,7 +122,10 @@ def proxy():
                 else:
                     segment_url = f"{base_url}/{line}"
                 encoded_url = urllib.parse.quote(segment_url)
-                new_lines.append(f"/proxy?url={encoded_url}")
+                proxy_line = f"/proxy?url={encoded_url}"
+                if referrer:
+                    proxy_line += f"&ref={urllib.parse.quote(referrer)}"
+                new_lines.append(proxy_line)
 
         return Response("\n".join(new_lines), mimetype="application/vnd.apple.mpegurl")
 
@@ -304,11 +311,11 @@ def get_stream_for_episode(show_id, episode_string, mode="sub"):
         stream = anime.get_video(episode=ep_num, lang=lang, preferred_quality=1080)
 
         if stream:
-            return getattr(stream, "url", None)
+            return {"url": getattr(stream, "url", None), "referrer": getattr(stream, "referrer", None)}
 
         stream = anime.get_video(episode=ep_num, lang=lang)
         if stream:
-            return getattr(stream, "url", None)
+            return {"url": getattr(stream, "url", None), "referrer": getattr(stream, "referrer", None)}
 
         return None
     except Exception as e:
@@ -346,10 +353,10 @@ def show(show_id):
 @app.route("/api/stream/<path:show_id>/<episode_string>")
 def get_stream(show_id, episode_string):
     mode = request.args.get("mode", "sub")
-    final_video_link = get_stream_for_episode(show_id, episode_string, mode)
+    stream_data = get_stream_for_episode(show_id, episode_string, mode)
 
-    if final_video_link:
-        return jsonify({"status": "success", "stream_url": final_video_link})
+    if stream_data and stream_data.get("url"):
+        return jsonify({"status": "success", "stream_url": stream_data["url"], "referrer": stream_data.get("referrer")})
     else:
         return jsonify(
             {"error": "Failed to extract final video link using anipy-cli provider."}

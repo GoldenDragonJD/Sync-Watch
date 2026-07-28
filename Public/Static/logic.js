@@ -636,7 +636,10 @@ async function playVideo(epNum, isRemote = false) {
       throw new Error("Stream not found");
     }
 
-    const proxyUrl = `/proxy?url=${encodeURIComponent(data.stream_url)}`;
+    let proxyUrl = `/proxy?url=${encodeURIComponent(data.stream_url)}`;
+    if (data.referrer) {
+      proxyUrl += `&ref=${encodeURIComponent(data.referrer)}`;
+    }
 
     if (currentHlsInstance) {
       currentHlsInstance.destroy();
