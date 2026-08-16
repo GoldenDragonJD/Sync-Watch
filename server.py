@@ -32,35 +32,28 @@ try:
     # Import Filters and Season for the new seasonal routing
     from anipy_api.provider import get_provider, list_providers, Filters, Season
 
-    # 1: Attempt to load AllAnime natively via the official string method
+    # 1: Attempt to load AniDBApp via the official string method (since AllAnime is broken)
     try:
-        provider = get_provider("allanime")
+        provider = get_provider("anidbapp")
     except Exception:
         pass
 
-    # 2: If AllAnime is broken/missing, fallback to AnimeKai using get_provider
+    # 2: If AniDBApp is broken/missing, try AnimeHub using get_provider
     if provider is None:
         try:
-            provider = get_provider("animekai")
-
-            if hasattr(provider, "session"):
-                provider.session.headers.update(
-                    {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Accept": "application/json, text/javascript, */*; q=0.01",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": "https://animekai.to/",
-                    }
-                )
+            provider = get_provider("animehub")
         except Exception:
             pass
 
     # 3: Failsafe loop (just grab the first working non-native provider)
     if provider is None:
         for p_class in list_providers():
-            if "native" not in getattr(p_class, "__name__", "").lower():
-                provider = p_class()
-                break
+            if getattr(p_class, "NAME", "") != "native":
+                try:
+                    provider = p_class()
+                    break
+                except Exception:
+                    pass
 
     if provider is not None:
         HAS_ANIPY = True
