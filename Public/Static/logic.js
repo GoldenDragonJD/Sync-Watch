@@ -724,11 +724,21 @@ function showSearchView() {
   watchView.classList.add("hidden");
   videoPlayer.pause();
   videoPlayer.removeAttribute("src");
+  
+  if (currentHlsInstance) {
+    currentHlsInstance.destroy();
+    currentHlsInstance = null;
+  }
+  
   videoPlayer.load();
+
+  // Clear search input so home page features (schedule, continue watching) reappear
+  searchInput.value = "";
+  
+  renderContinueWatching();
 
   if (searchInput.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
-    renderContinueWatching();
     resultsGrid.innerHTML = "";
   }
 }
