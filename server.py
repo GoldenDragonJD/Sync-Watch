@@ -12,7 +12,7 @@ from flask_socketio import SocketIO, emit
 # ==========================================
 # anipy-cli (anipy-api) Integration
 # ==========================================
-provider = None
+provider_list = []
 HAS_ANIPY = False
 Anime = None
 LANG_SUB = "sub"
@@ -32,33 +32,32 @@ try:
     # Import Filters and Season for the new seasonal routing
     from anipy_api.provider import get_provider, list_providers, Filters, Season
 
-    # 1: Attempt to load AniDBApp via the official string method (since AllAnime is broken)
+    # Attempt to load AniDBApp
     try:
-        provider = get_provider("anidbapp")
+        provider_list.append(get_provider("anidbapp"))
     except Exception:
         pass
 
-    # 2: If AniDBApp is broken/missing, try AnimeHub using get_provider
-    if provider is None:
-        try:
-            provider = get_provider("animehub")
-        except Exception:
-            pass
+    # Attempt to load AnimeHub
+    try:
+        provider_list.append(get_provider("animehub"))
+    except Exception:
+        pass
+        
+    # Grab any other working non-native providers
+    for p_class in list_providers():
+        if getattr(p_class, "NAME", "") != "native":
+            try:
+                new_provider = p_class()
+                # avoid duplicates if get_provider already added it
+                if not any(isinstance(p, p_class) for p in provider_list):
+                    provider_list.append(new_provider)
+            except Exception:
+                pass
 
-    # 3: Failsafe loop (just grab the first working non-native provider)
-    if provider is None:
-        for p_class in list_providers():
-            if getattr(p_class, "NAME", "") != "native":
-                try:
-                    provider = p_class()
-                    break
-                except Exception:
-                    pass
-
-    if provider is not None:
+    if len(provider_list) > 0:
         HAS_ANIPY = True
-        actual_name = getattr(provider.__class__, "__name__", "Unknown")
-        print(f"Successfully loaded anipy-api provider: {actual_name}")
+        print(f"Successfully loaded {len(provider_list)} anipy-api providers.")
     else:
         print(
             "WARNING: anipy-api provider could not be loaded. No online providers found."
@@ -145,7 +144,7 @@ def proxy():
 # ==========================================
 
 def search_anime(query, mode="sub"):
-    if not HAS_ANIPY or not provider:
+    if not HAS_ANIPY or not provider_list:
         return [
             {
                 "name": "Error: anipy-api provider failed to load",
@@ -157,98 +156,106 @@ def search_anime(query, mode="sub"):
     search_query = f"{query} dub" if mode == "dub" else query
     print(f"--- Searching for: {search_query} ---")
 
-    try:
-        search_results = provider.get_search(search_query)
-        formatted_results = []
+    for provider in provider_list:
+        try:
+            search_results = provider.get_search(search_query)
+            if not search_results:
+                continue
 
-        for res in search_results:
-            _id = None
-            name = "Unknown"
-            eps_sub = "?"
-            eps_dub = "?"
+            formatted_results = []
+            for res in search_results:
+                _id = None
+                name = "Unknown"
+                eps_sub = "?"
+                eps_dub = "?"
 
-            if isinstance(res, dict):
-                _id = (
-                    res.get("url")
-                    or res.get("slug")
-                    or res.get("id")
-                    or res.get("identifier")
-                    or res.get("link")
-                )
-                name = res.get("name") or res.get("title") or "Unknown"
-                av_eps = res.get("availableEpisodes", {})
-                if isinstance(av_eps, dict):
-                    eps_sub = av_eps.get("sub", "?")
-                    eps_dub = av_eps.get("dub", "?")
+                if isinstance(res, dict):
+                    _id = (
+                        res.get("url")
+                        or res.get("slug")
+                        or res.get("id")
+                        or res.get("identifier")
+                        or res.get("link")
+                    )
+                    name = res.get("name") or res.get("title") or "Unknown"
+                    av_eps = res.get("availableEpisodes", {})
+                    if isinstance(av_eps, dict):
+                        eps_sub = av_eps.get("sub", "?")
+                        eps_dub = av_eps.get("dub", "?")
+                    else:
+                        eps_sub = res.get("episodes", "?")
+
                 else:
-                    eps_sub = res.get("episodes", "?")
-
-            else:
-                _id = (
-                    getattr(res, "url", None)
-                    or getattr(res, "slug", None)
-                    or getattr(res, "id", None)
-                    or getattr(res, "identifier", None)
-                    or getattr(res, "link", None)
-                )
-                name = (
-                    getattr(res, "name", None)
-                    or getattr(res, "title", None)
-                    or "Unknown"
-                )
-
-                av_eps = getattr(res, "availableEpisodes", None)
-                if isinstance(av_eps, dict):
-                    eps_sub = av_eps.get("sub", "?")
-                    eps_dub = av_eps.get("dub", "?")
-                else:
-                    eps_sub = getattr(
-                        res, "episodes", getattr(res, "episode_count", "?")
+                    _id = (
+                        getattr(res, "url", None)
+                        or getattr(res, "slug", None)
+                        or getattr(res, "id", None)
+                        or getattr(res, "identifier", None)
+                        or getattr(res, "link", None)
+                    )
+                    name = (
+                        getattr(res, "name", None)
+                        or getattr(res, "title", None)
+                        or "Unknown"
                     )
 
-                if not _id and hasattr(res, "__dict__"):
-                    d = vars(res)
-                    _id = d.get("url") or d.get("slug") or d.get("id") or d.get("link")
-                    name = d.get("name") or d.get("title") or name
-                    av_eps_d = d.get("availableEpisodes", {})
-                    if isinstance(av_eps_d, dict):
-                        eps_sub = av_eps_d.get("sub", "?")
-                        eps_dub = av_eps_d.get("dub", "?")
+                    av_eps = getattr(res, "availableEpisodes", None)
+                    if isinstance(av_eps, dict):
+                        eps_sub = av_eps.get("sub", "?")
+                        eps_dub = av_eps.get("dub", "?")
                     else:
-                        eps_sub = d.get("episodes", eps_sub)
+                        eps_sub = getattr(
+                            res, "episodes", getattr(res, "episode_count", "?")
+                        )
 
-            if not _id:
-                clean_name = (
-                    str(name)
-                    .lower()
-                    .replace(" ", "-")
-                    .replace(":", "")
-                    .replace("!", "")
-                    .replace("'", "")
-                    .replace(",", "")
+                    if not _id and hasattr(res, "__dict__"):
+                        d = vars(res)
+                        _id = d.get("url") or d.get("slug") or d.get("id") or d.get("link")
+                        name = d.get("name") or d.get("title") or name
+                        av_eps_d = d.get("availableEpisodes", {})
+                        if isinstance(av_eps_d, dict):
+                            eps_sub = av_eps_d.get("sub", "?")
+                            eps_dub = av_eps_d.get("dub", "?")
+                        else:
+                            eps_sub = d.get("episodes", eps_sub)
+
+                if not _id:
+                    clean_name = (
+                        str(name)
+                        .lower()
+                        .replace(" ", "-")
+                        .replace(":", "")
+                        .replace("!", "")
+                        .replace("'", "")
+                        .replace(",", "")
+                    )
+                    _id = f"/category/{clean_name}"
+                
+                # Append provider class name to identify which provider found the anime
+                _id = f"{provider.__class__.__name__}::{_id}"
+                
+                safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8")
+                safe_id = safe_id.rstrip("=")
+
+                formatted_results.append(
+                    {
+                        "_id": safe_id,
+                        "name": str(name),
+                        "availableEpisodes": {"sub": eps_sub, "dub": eps_dub},
+                        "__typename": "Anime",
+                    }
                 )
-                _id = f"/category/{clean_name}"
 
-            safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8")
-            safe_id = safe_id.rstrip("=")
+            return formatted_results
+        except Exception as e:
+            print(f"Search Error with {provider.__class__.__name__}: {e}")
+            continue
 
-            formatted_results.append(
-                {
-                    "_id": safe_id,
-                    "name": str(name),
-                    "availableEpisodes": {"sub": eps_sub, "dub": eps_dub},
-                    "__typename": "Anime",
-                }
-            )
-
-        return formatted_results
-    except Exception as e:
-        print(f"Search Error: {e}")
-        return []
+    return []
 
 
 def get_episodes(show_id):
-    if not HAS_ANIPY or not provider or not Anime:
+    if not HAS_ANIPY or not provider_list or not Anime:
         return {"sub": [], "dub": []}
 
     try:
@@ -259,10 +266,18 @@ def get_episodes(show_id):
             )
         except:
             real_id = show_id
+            
+        provider_to_use = provider_list[0]
+        if "::" in real_id:
+            provider_name, real_id = real_id.split("::", 1)
+            for p in provider_list:
+                if p.__class__.__name__ == provider_name:
+                    provider_to_use = p
+                    break
 
-        print(f"--- Fetching episodes for decoded ID: {real_id} ---")
+        print(f"--- Fetching episodes for decoded ID: {real_id} using {provider_to_use.__class__.__name__} ---")
 
-        anime = Anime(provider, real_id, real_id, "Unknown")
+        anime = Anime(provider_to_use, real_id, real_id, "Unknown")
         eps = anime.get_episodes(lang=LANG_SUB)
 
         if not eps:
@@ -279,7 +294,7 @@ def get_episodes(show_id):
 
 
 def get_stream_for_episode(show_id, episode_string, mode="sub"):
-    if not HAS_ANIPY or not provider or not Anime:
+    if not HAS_ANIPY or not provider_list or not Anime:
         return None
 
     try:
@@ -290,8 +305,16 @@ def get_stream_for_episode(show_id, episode_string, mode="sub"):
             )
         except:
             real_id = show_id
+            
+        provider_to_use = provider_list[0]
+        if "::" in real_id:
+            provider_name, real_id = real_id.split("::", 1)
+            for p in provider_list:
+                if p.__class__.__name__ == provider_name:
+                    provider_to_use = p
+                    break
 
-        anime = Anime(provider, real_id, real_id, "Unknown")
+        anime = Anime(provider_to_use, real_id, real_id, "Unknown")
         lang = LANG_DUB if mode == "dub" else LANG_SUB
 
         try:
@@ -385,7 +408,7 @@ def update_current_season_loop():
     while True:
         update_event.clear()
         try:
-            if not HAS_ANIPY or not provider:
+            if not HAS_ANIPY or not provider_list:
                 time.sleep(60)
                 continue
                 
@@ -393,7 +416,15 @@ def update_current_season_loop():
             season_enum = getattr(Season, season_str, Season.SUMMER)
             filters = Filters(year=year, season=season_enum)
             
-            seasonal_results = provider.get_search("", filters=filters)
+            seasonal_results = None
+            for p in provider_list:
+                try:
+                    seasonal_results = p.get_search("", filters=filters)
+                    if seasonal_results:
+                        break
+                except Exception:
+                    pass
+
             formatted_results = []
             
             if seasonal_results:
@@ -410,6 +441,8 @@ def update_current_season_loop():
                     if not _id:
                         continue
                         
+                    # Prepend provider class name
+                    _id = f"{p.__class__.__name__}::{_id}"
                     safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8").rstrip("=")
                     
                     try:
@@ -448,7 +481,7 @@ def force_update_season():
 
 @app.route("/api/seasonal")
 def get_seasonal():
-    if not HAS_ANIPY or not provider:
+    if not HAS_ANIPY or not provider_list:
         return jsonify({"error": "anipy-api provider not loaded"}), 500
 
     req_year = request.args.get("year", type=int)
@@ -475,10 +508,19 @@ def get_seasonal():
         season_enum = getattr(Season, req_season, Season.SUMMER)
         filters = Filters(year=req_year, season=season_enum)
 
-        seasonal_results = provider.get_search("", filters=filters)
+        seasonal_results = None
+        used_provider = None
+        for p in provider_list:
+            try:
+                seasonal_results = p.get_search("", filters=filters)
+                if seasonal_results:
+                    used_provider = p
+                    break
+            except Exception:
+                pass
 
         formatted_results = []
-        if seasonal_results:
+        if seasonal_results and used_provider:
             for res in seasonal_results:
                 d = res if isinstance(res, dict) else vars(res) if hasattr(res, "__dict__") else {}
                 _id = (
@@ -503,6 +545,9 @@ def get_seasonal():
 
                 eps_sub = av_eps.get("sub", fallback_ep)
                 eps_dub = av_eps.get("dub", "?")
+                
+                # Prepend provider class name
+                _id = f"{used_provider.__class__.__name__}::{_id}"
 
                 safe_id = base64.urlsafe_b64encode(str(_id).encode("utf-8")).decode("utf-8").rstrip("=")
 
