@@ -483,7 +483,7 @@ function renderSearchResults(shows) {
     `;
 
     card.addEventListener("click", () => {
-      const id = show._id || show.id || show.url;
+      const id = show.name || show._id || show.id || show.url;
       if (!id) {
         alert("Sorry, this show has a broken ID and cannot be loaded.");
         return;
@@ -491,7 +491,9 @@ function renderSearchResults(shows) {
 
       let targetEp = 1;
       const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
-      const savedShow = history.find((item) => item.id === id);
+      const savedShow = history.find(
+        (item) => item.name === show.name || item.id === id,
+      );
       if (savedShow && savedShow.ep) {
         targetEp = savedShow.ep;
       }
@@ -602,11 +604,9 @@ async function playVideo(epNum, isRemote = false) {
   updateWatchHistory(currentShowId, currentShowName, epNum);
   updateURL(currentShowId, currentShowName, epNum);
 
-  resolveMalId(currentShowId, currentShowName).then((malId) => {
-    if (malId) {
-      fetchSkipTimes(malId, epNum);
-    }
-  });
+  currentSkipTimes = [];
+  activeSkip = null;
+  hideSkipButton();
 
   if (controlsContainer) {
     const currentIndex = currentEpisodeList.indexOf(epNum.toString());
@@ -636,6 +636,38 @@ async function playVideo(epNum, isRemote = false) {
       throw new Error("Stream not found");
     }
 
+    // Populate skip times from stream payload (ZokoAnime embed) or via AniSkip if mal_id is present
+    if (data.skip) {
+      const skips = [];
+      if (
+        data.skip.intro &&
+        data.skip.intro.end > data.skip.intro.start
+      ) {
+        skips.push({
+          type: "op",
+          start: data.skip.intro.start,
+          end: data.skip.intro.end,
+        });
+      }
+      if (
+        data.skip.outro &&
+        data.skip.outro.end > data.skip.outro.start
+      ) {
+        skips.push({
+          type: "ed",
+          start: data.skip.outro.start,
+          end: data.skip.outro.end,
+        });
+      }
+      if (skips.length > 0) {
+        currentSkipTimes = skips;
+      } else if (data.mal_id) {
+        fetchSkipTimes(data.mal_id, epNum);
+      }
+    } else if (data.mal_id) {
+      fetchSkipTimes(data.mal_id, epNum);
+    }
+
     let proxyUrl = `/proxy?url=${encodeURIComponent(data.stream_url)}`;
     if (data.referrer) {
       proxyUrl += `&ref=${encodeURIComponent(data.referrer)}`;
@@ -646,7 +678,27 @@ async function playVideo(epNum, isRemote = false) {
       currentHlsInstance = null;
     }
 
+    // Attach subtitles track if provided by the server
+    videoPlayer.querySelectorAll("track").forEach((t) => t.remove());
+    if (data.sub_url) {
+      let subProxyUrl = `/proxy?url=${encodeURIComponent(data.sub_url)}`;
+      if (data.referrer) {
+        subProxyUrl += `&ref=${encodeURIComponent(data.referrer)}`;
+      }
+      const track = document.createElement("track");
+      track.kind = "subtitles";
+      track.label = "English";
+      track.srclang = "en";
+      track.src = subProxyUrl;
+      track.default = true;
+      videoPlayer.appendChild(track);
+    }
+
     const resumePlayback = () => {
+      if (videoPlayer.textTracks && videoPlayer.textTracks.length > 0) {
+        videoPlayer.textTracks[0].mode = data.sub_url ? "showing" : "disabled";
+      }
+
       const savedTime = localStorage.getItem(`save_${currentShowId}_${epNum}`);
       if (savedTime) {
         videoPlayer.currentTime = parseFloat(savedTime);
@@ -1178,14 +1230,15 @@ function renderContinueWatching() {
         `;
 
     card.addEventListener("click", () => {
+      const showKey = item.name || item.id;
       if (isSyncEnabled && socket) {
         socket.emit("load_show_action", {
-          showId: item.id,
+          showId: showKey,
           showName: item.name,
           targetEpNum: item.ep,
         });
       }
-      loadEpisodes(item.id, item.name, item.ep);
+      loadEpisodes(showKey, item.name, item.ep);
     });
 
     cwControls.appendChild(card);
