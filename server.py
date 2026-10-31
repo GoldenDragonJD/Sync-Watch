@@ -1505,11 +1505,11 @@ def handle_seek_sync(data):
     sync_cooldown_until = time.time() + 5.0
     emit("receive_seek", data, broadcast=True, include_self=False)
 
-
+# Initialize database and background thread for both Flask and Gunicorn
 init_db()
+socketio.start_background_task(update_current_season_loop)
 
 if __name__ == "__main__":
-    threading.Thread(target=update_current_season_loop, daemon=True).start()
     socketio.run(
         app, debug=True, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True
     )
