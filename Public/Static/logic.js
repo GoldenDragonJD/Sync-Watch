@@ -23,6 +23,7 @@ const autoplayCheckbox = document.getElementById("autoplay-toggle");
 // NEW: Custom Player DOM Elements
 const videoWrapper = document.getElementById("video-wrapper");
 const playPauseBtn = document.getElementById("play-pause-btn");
+const playerNextEpBtn = document.getElementById("player-next-ep-btn");
 const progressBar = document.getElementById("progress-bar");
 const muteBtn = document.getElementById("mute-btn");
 const volumeBar = document.getElementById("volume-bar");
@@ -86,6 +87,7 @@ videoPlayer.addEventListener("pause", () => {
 // 1. Play & Pause
 function togglePlay() {
   if (videoPlayer.paused) {
+    videoOverlay.classList.add("hidden");
     videoPlayer.play();
   } else {
     videoPlayer.pause();
@@ -142,47 +144,6 @@ function formatTime(seconds) {
   const s = Math.floor(seconds % 60);
   return `${m < 10 ? "0" : ""}${m}:${s < 10 ? "0" : ""}${s}`;
 }
-
-// 3. Update Progress Bar & Time Display
-videoPlayer.addEventListener("timeupdate", () => {
-  if (!videoOverlay.classList.contains("hidden")) return;
-  if (!videoPlayer.duration) return;
-
-  const currentTime = videoPlayer.currentTime;
-
-  const progressPercent = (currentTime / videoPlayer.duration) * 100;
-  progressBar.value = progressPercent;
-
-  timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
-
-  if (currentShowId && currentEpNum && currentTime > 0) {
-    localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
-  }
-
-  if (currentSkipTimes.length > 0) {
-    const matchingSkip = currentSkipTimes.find(
-      (skip) => currentTime >= skip.start && currentTime <= skip.end,
-    );
-
-    if (matchingSkip) {
-      if (activeSkip !== matchingSkip) {
-        activeSkip = matchingSkip;
-        showSkipButton(matchingSkip);
-      }
-    } else {
-      if (activeSkip !== null) {
-        activeSkip = null;
-        hideSkipButton();
-      }
-    }
-  }
-});
-
-// 4. Seek via Custom Progress Bar
-progressBar.addEventListener("input", (e) => {
-  const newTime = (e.target.value / 100) * videoPlayer.duration;
-  videoPlayer.currentTime = newTime;
-});
 
 // --- Hover Tooltip Logic ---
 progressBar.addEventListener("mousemove", (e) => {
@@ -245,6 +206,57 @@ function toggleFullScreen() {
 fullscreenBtn.addEventListener("click", toggleFullScreen);
 videoWrapper.addEventListener("dblclick", toggleFullScreen);
 
+// 7. Global Keyboard Controls on Watch Screen
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (watchView.classList.contains("hidden")) return;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (videoPlayer.duration) {
+        videoPlayer.currentTime = Math.max(0, (videoPlayer.currentTime || 0) - 5);
+      }
+      showUIAndResetTimer();
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (videoPlayer.duration) {
+        videoPlayer.currentTime = Math.min(
+          videoPlayer.duration,
+          (videoPlayer.currentTime || 0) + 5,
+        );
+      }
+      showUIAndResetTimer();
+    } else if (e.key === " " || e.code === "Space") {
+      e.preventDefault();
+      e.stopPropagation();
+      togglePlay();
+      showUIAndResetTimer();
+    } else if (e.key === "f" || e.key === "F" || e.code === "KeyF") {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleFullScreen();
+      showUIAndResetTimer();
+    }
+  },
+  true,
+);
+
+window.addEventListener(
+  "keyup",
+  (e) => {
+    if (watchView.classList.contains("hidden")) return;
+    if (e.key === " " || e.code === "Space") {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  },
+  true,
+);
+
 // Loading overlay click
 videoOverlay.addEventListener("click", () => {
   videoOverlay.classList.add("hidden");
@@ -274,6 +286,7 @@ backBtn.addEventListener("click", () => {
 });
 
 modeToggle.addEventListener("change", () => {
+  modeToggle.blur();
   if (currentShowId) {
     localStorage.setItem(`langPref_${currentShowId}`, modeToggle.value);
     loadEpisodes(currentShowId, currentShowName, currentEpNum);
@@ -292,6 +305,10 @@ function playNextEpisode() {
       isSkipping = false;
     }, 2000);
 
+    if (currentShowId && currentEpNum) {
+      localStorage.removeItem(`save_${currentShowId}_${currentEpNum}`);
+    }
+
     const nextEp = currentEpisodeList[currentIndex + 1];
 
     document.querySelectorAll(".ep-btn").forEach((b) => {
@@ -304,8 +321,14 @@ function playNextEpisode() {
 }
 
 nextEpBtn.addEventListener("click", playNextEpisode);
+if (playerNextEpBtn) {
+  playerNextEpBtn.addEventListener("click", playNextEpisode);
+}
 
 videoPlayer.addEventListener("ended", () => {
+  if (currentShowId && currentEpNum) {
+    localStorage.removeItem(`save_${currentShowId}_${currentEpNum}`);
+  }
   if (isAutoplayEnabled) {
     playNextEpisode();
   }
@@ -608,13 +631,14 @@ async function playVideo(epNum, isRemote = false) {
   activeSkip = null;
   hideSkipButton();
 
+  const currentIndex = currentEpisodeList.indexOf(epNum.toString());
+  const hasNextEp =
+    currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1;
   if (controlsContainer) {
-    const currentIndex = currentEpisodeList.indexOf(epNum.toString());
-    if (currentIndex !== -1 && currentIndex < currentEpisodeList.length - 1) {
-      controlsContainer.classList.remove("hidden");
-    } else {
-      controlsContainer.classList.add("hidden");
-    }
+    controlsContainer.classList.toggle("hidden", !hasNextEp);
+  }
+  if (playerNextEpBtn) {
+    playerNextEpBtn.classList.toggle("hidden", !hasNextEp);
   }
 
   videoOverlay.classList.remove("hidden");
@@ -701,7 +725,25 @@ async function playVideo(epNum, isRemote = false) {
 
       const savedTime = localStorage.getItem(`save_${currentShowId}_${epNum}`);
       if (savedTime) {
-        videoPlayer.currentTime = parseFloat(savedTime);
+        const parsedTime = parseFloat(savedTime);
+        const applySavedTime = () => {
+          if (
+            videoPlayer.duration &&
+            parsedTime >= videoPlayer.duration - 60
+          ) {
+            localStorage.removeItem(`save_${currentShowId}_${epNum}`);
+            videoPlayer.currentTime = 0;
+          } else {
+            videoPlayer.currentTime = parsedTime;
+          }
+        };
+        if (videoPlayer.duration) {
+          applySavedTime();
+        } else {
+          videoPlayer.addEventListener("loadedmetadata", applySavedTime, {
+            once: true,
+          });
+        }
       } else {
         videoPlayer.currentTime = 0;
       }
@@ -798,6 +840,9 @@ function showSearchView() {
 function showWatchView() {
   searchView.classList.add("hidden");
   watchView.classList.remove("hidden");
+  if (document.activeElement && document.activeElement !== document.body) {
+    document.activeElement.blur();
+  }
 }
 
 // ==========================================
@@ -1282,7 +1327,14 @@ videoPlayer.addEventListener("timeupdate", () => {
   timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
 
   if (currentShowId && currentEpNum && currentTime > 0) {
-    localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
+    if (
+      videoPlayer.ended ||
+      (videoPlayer.duration && videoPlayer.duration - currentTime <= 5)
+    ) {
+      localStorage.removeItem(`save_${currentShowId}_${currentEpNum}`);
+    } else {
+      localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
+    }
   }
 
   if (currentSkipTimes.length > 0) {
