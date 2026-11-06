@@ -1082,10 +1082,16 @@ function buildSeasonalFilters() {
     e.target.disabled = true;
     const originalText = e.target.textContent;
     e.target.textContent = "Updating...";
+    const year = document.getElementById("year-select").value;
+    const season = document.getElementById("season-select").value;
     try {
-      const res = await fetch("/api/seasonal/force_update", { method: "POST" });
+      const res = await fetch(
+        `/api/seasonal/force_update?year=${encodeURIComponent(year)}&season=${encodeURIComponent(season)}`,
+        { method: "POST" },
+      );
       if (res.ok) {
-        e.target.textContent = "Started!";
+        e.target.textContent = "Updated!";
+        await fetchSeasonal(year, season);
       } else {
         throw new Error("Update failed");
       }

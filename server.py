@@ -259,13 +259,8 @@ class HiAnimeServer(BaseAnimeServer):
             m_dub = re.search(
                 r'tick-dub[^>]*>.*?</i\s*>\s*([0-9]+)', item, re.DOTALL
             )
-            m_eps = re.search(r'tick-eps[^>]*>\s*([0-9]+)', item, re.DOTALL)
 
-            sub_eps = (
-                m_sub.group(1)
-                if m_sub
-                else (m_eps.group(1) if m_eps else "?")
-            )
+            sub_eps = m_sub.group(1) if m_sub else "?"
             dub_eps = m_dub.group(1) if m_dub else "0"
 
             results.append(
@@ -446,12 +441,58 @@ class HiAnimeServer(BaseAnimeServer):
             "skip": embed_data.get("skip"),
         }
 
+    SEASON_DATE_RANGES = {
+        "winter": (1, 1, 3, 31),
+        "spring": (3, 1, 6, 30),
+        "summer": (6, 1, 9, 30),
+        "fall": (9, 1, 12, 31),
+    }
+
+    def _fetch_paginated_filter(self, query_params, max_pages=15):
+        all_items = []
+        for page_num in range(1, max_pages + 1):
+            url = f"{BASE_API}/filter?{query_params}&page={page_num}"
+            page_html = hianime_curl(url)
+            items = self._parse_flw_items(page_html)
+            if not items:
+                break
+            all_items.extend(items)
+            if f"page={page_num + 1}" not in page_html:
+                break
+        return all_items
+
     def get_seasonal(self, year, season):
         season_clean = str(season).strip().lower()
         if season_clean not in ("spring", "summer", "fall", "winter"):
             season_clean = "fall"
-        page = hianime_curl(FILTER_API % (season_clean, int(year)))
-        return self._parse_flw_items(page)
+        yr = int(year)
+        sm, sd, em, ed = self.SEASON_DATE_RANGES[season_clean]
+
+        # 1. Fetch all pages matching the season's start-date window (catches shows missing season tags like Black Clover Season 2)
+        date_query = (
+            f"sy={yr}&sm={sm}&sd={sd}&ey={yr}&em={em}&ed={ed}&sort=updated_date"
+        )
+        date_items = self._fetch_paginated_filter(date_query)
+
+        # 2. Fetch all pages explicitly tagged with the season on hianime.at
+        season_query = f"season={season_clean}&sy={yr}&ey={yr}&sort=updated_date"
+        season_items = self._fetch_paginated_filter(season_query)
+
+        combined = []
+        seen_codes = set()
+        for item in date_items + season_items:
+            code = item.get("server_code")
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                combined.append(item)
+
+        # Prefer entries that have aired episodes available; fall back to all if previewing a future un-aired season
+        aired_items = [
+            item
+            for item in combined
+            if not (item.get("sub", "?") == "?" and item.get("dub", "0") in ("0", "?"))
+        ]
+        return aired_items if aired_items else combined
 
 
 # Registry of anime servers (supports multiple servers)
@@ -694,6 +735,7 @@ def save_anime_mappings_batch(entries):
                         break
 
             # 2. Insert or update anime row
+            existing = None
             if anime_id is None:
                 c.execute(
                     """INSERT INTO anime (name, mal_id, sub_episodes, dub_episodes, last_updated)
@@ -731,15 +773,27 @@ def save_anime_mappings_batch(entries):
 
             # 4. Insert or update server -> code mapping
             if server_name and server_code:
-                c.execute(
-                    """INSERT INTO anime_server_codes (anime_id, anime_name, server_name, server_code, last_updated)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(anime_id, server_name) DO UPDATE SET
-                           anime_name = excluded.anime_name,
-                           server_code = excluded.server_code,
-                           last_updated = excluded.last_updated""",
-                    (anime_id, canonical_name, server_name, str(server_code), now),
+                has_new_eps = (sub_eps != "?") or (dub_eps not in ("?", "0"))
+                had_existing_eps = existing is not None and (
+                    (existing[1] and existing[1] != "?")
+                    or (existing[2] and existing[2] not in ("?", "0"))
                 )
+                if had_existing_eps and not has_new_eps:
+                    c.execute(
+                        """INSERT OR IGNORE INTO anime_server_codes (anime_id, anime_name, server_name, server_code, last_updated)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (anime_id, canonical_name, server_name, str(server_code), now),
+                    )
+                else:
+                    c.execute(
+                        """INSERT INTO anime_server_codes (anime_id, anime_name, server_name, server_code, last_updated)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(anime_id, server_name) DO UPDATE SET
+                               anime_name = excluded.anime_name,
+                               server_code = excluded.server_code,
+                               last_updated = excluded.last_updated""",
+                        (anime_id, canonical_name, server_name, str(server_code), now),
+                    )
 
             canonical_names.append(canonical_name)
 
@@ -1301,8 +1355,27 @@ def update_current_season_loop():
 
 @app.route("/api/seasonal/force_update", methods=["POST"])
 def force_update_season():
-    update_event.set()
-    return jsonify({"status": "success", "message": "Update triggered"})
+    req_data = request.get_json(silent=True) or {}
+    req_year = req_data.get("year") or request.args.get("year", type=int)
+    req_season = (req_data.get("season") or request.args.get("season") or "").lower()
+
+    curr_year, curr_season = get_current_season()
+    target_year = int(req_year) if req_year else curr_year
+    target_season = req_season if req_season else curr_season
+
+    try:
+        results = fetch_and_cache_season(target_year, target_season)
+        update_event.set()
+        return jsonify(
+            {
+                "status": "success",
+                "message": f"Updated {len(results)} anime for {target_season} {target_year}",
+                "data": results,
+            }
+        )
+    except Exception as e:
+        print(f"Force update error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/api/seasonal")
