@@ -472,6 +472,13 @@ async function handleSearch(e) {
   }
 }
 
+function posterHtml(src, alt) {
+  if (!src) return "";
+  const safeAlt = String(alt || "").replace(/"/g, "&quot;");
+  const proxiedSrc = `/api/image_proxy?url=${encodeURIComponent(src)}`;
+  return `<img class="card-poster" src="${proxiedSrc}" alt="${safeAlt}" loading="lazy" decoding="async" onerror="this.remove()">`;
+}
+
 function renderSearchResults(shows) {
   if (!shows || shows.length === 0) {
     resultsGrid.innerHTML = "<p>No shows found.</p>";
@@ -501,6 +508,7 @@ function renderSearchResults(shows) {
       : "View Episodes";
 
     card.innerHTML = `
+      ${posterHtml(show.image, show.name)}
       <h3>${show.name}</h3>
       <p class="eps-text" style="color: var(--primary); font-size: 0.9rem;">${epsText}</p>
     `;
@@ -1191,6 +1199,7 @@ function renderSeasonal(animeList, trackerKey) {
     const dubCount = (dubVal !== undefined && dubVal !== null && dubVal !== "?") ? dubVal : "-";
 
     card.innerHTML = `
+      ${posterHtml(anime.image, title)}
       <div style="padding: 0.5rem;">
           <h4 style="margin-bottom: 0.3rem; font-size: 1rem; display: flex; align-items: center; justify-content: space-between;">
              <span style="flex: 1;">${title}</span>

@@ -1,5 +1,6 @@
 import base64
 import datetime
+import hashlib
 import html
 import json
 import os
@@ -20,7 +21,100 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "seasonal_cache.db")
 SQL_FILE_PATH = os.path.join(BASE_DIR, "anime_servers.sql")
+IMAGE_CACHE_DIR = os.path.join(BASE_DIR, "image_cache")
+os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
 db_lock = threading.Lock()
+
+# Image cache in-memory tracking & policies
+# Normal expiry: 24 hours. Startup expiry for unaccessed images: 12 hours.
+IMAGE_EXPIRY_SECONDS = 24 * 3600
+STARTUP_EXPIRY_SECONDS = 12 * 3600
+image_cache_lock = threading.Lock()
+server_start_time = time.time()
+# Maps url_hash -> {"path": local_filepath, "expires_at": float_timestamp, "remote_url": str}
+image_cache_index = {}
+
+
+def init_image_cache_on_startup():
+    """
+    On server restart: scans existing images on disk in image_cache/
+    and assigns a 12-hour grace timer. If an image is not accessed or refreshed
+    within 12 hours of this restart, it will be automatically removed.
+    """
+    with image_cache_lock:
+        if not os.path.exists(IMAGE_CACHE_DIR):
+            return
+        now = time.time()
+        for fname in os.listdir(IMAGE_CACHE_DIR):
+            fpath = os.path.join(IMAGE_CACHE_DIR, fname)
+            if not os.path.isfile(fpath):
+                continue
+            name_part, _ = os.path.splitext(fname)
+            image_cache_index[name_part] = {
+                "path": fpath,
+                "expires_at": now + STARTUP_EXPIRY_SECONDS,
+                "remote_url": None,
+            }
+
+
+def touch_cached_image(url_hash):
+    """
+    When an image is requested/called, reset its timer to 24 hours.
+    """
+    with image_cache_lock:
+        entry = image_cache_index.get(url_hash)
+        if entry:
+            entry["expires_at"] = time.time() + IMAGE_EXPIRY_SECONDS
+
+
+def refresh_cached_images_for_urls(remote_urls):
+    """
+    When an anime check occurs and the anime is still active, reset the timer
+    to 24 hours for all its associated images so active anime posters stay cached.
+    """
+    if not remote_urls:
+        return
+    now = time.time()
+    with image_cache_lock:
+        for url in remote_urls:
+            if not url or not isinstance(url, str) or not url.startswith("http"):
+                continue
+            h = hashlib.sha256(url.encode("utf-8")).hexdigest()
+            entry = image_cache_index.get(h)
+            if entry:
+                entry["expires_at"] = now + IMAGE_EXPIRY_SECONDS
+
+
+def cleanup_expired_images():
+    """
+    Removes cached images whose timer has expired.
+    """
+    now = time.time()
+    to_delete = []
+    with image_cache_lock:
+        for h, entry in list(image_cache_index.items()):
+            if now >= entry["expires_at"]:
+                to_delete.append((h, entry["path"]))
+                del image_cache_index[h]
+
+    for h, path in to_delete:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"Error removing expired image {path}: {e}")
+
+
+def image_cleanup_loop():
+    """
+    Background worker that runs cleanup periodically (every 10 minutes).
+    """
+    while True:
+        try:
+            cleanup_expired_images()
+        except Exception as e:
+            print(f"Error in image cleanup worker: {e}")
+        time.sleep(600)
 
 # ==========================================
 # ani-cli (hianime.at) Configuration & Scraping
@@ -263,6 +357,17 @@ class HiAnimeServer(BaseAnimeServer):
             sub_eps = m_sub.group(1) if m_sub else "?"
             dub_eps = m_dub.group(1) if m_dub else "0"
 
+            # Poster image (prefer lazy-load data-src if present)
+            m_img = re.search(
+                r'<img[^>]*?(?:data-src|src)="([^"]+)"[^>]*film-poster-img'
+                r'|<img[^>]*film-poster-img[^>]*?(?:data-src|src)="([^"]+)"',
+                item,
+                re.DOTALL,
+            )
+            image = ""
+            if m_img:
+                image = html.unescape((m_img.group(1) or m_img.group(2) or "").strip())
+
             results.append(
                 {
                     "server_code": slug,
@@ -270,6 +375,7 @@ class HiAnimeServer(BaseAnimeServer):
                     "alt_names": alt_names,
                     "sub": sub_eps,
                     "dub": dub_eps,
+                    "image": image,
                 }
             )
 
@@ -990,6 +1096,7 @@ def search_anime(query, mode="sub"):
                         "server_code": item["server_code"],
                         "sub": item.get("sub", "?"),
                         "dub": item.get("dub", "?"),
+                        "image": item.get("image", ""),
                     }
                 )
         except Exception as e:
@@ -1008,6 +1115,7 @@ def search_anime(query, mode="sub"):
                         "sub": str(item.get("sub", "?")),
                         "dub": str(item.get("dub", "?")),
                     },
+                    "image": item.get("image", ""),
                     "__typename": "Anime",
                 }
 
@@ -1165,6 +1273,81 @@ def proxy():
     return Response(generate(), status=req.status_code, headers=response_headers)
 
 
+@app.route("/api/image_proxy")
+def image_proxy():
+    raw_url = request.args.get("url")
+    if not raw_url:
+        return "Missing url parameter", 400
+
+    h = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()
+
+    # Determine extension from url or default to .jpg
+    ext = ".jpg"
+    parsed_path = urllib.parse.urlparse(raw_url).path
+    candidate_ext = os.path.splitext(parsed_path)[1].lower()
+    if candidate_ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"]:
+        ext = candidate_ext
+
+    cache_file = os.path.join(IMAGE_CACHE_DIR, f"{h}{ext}")
+
+    # Check if cached and valid
+    now = time.time()
+    with image_cache_lock:
+        entry = image_cache_index.get(h)
+        if entry and os.path.exists(entry["path"]):
+            # Reset the timer to 24 hours whenever called!
+            entry["expires_at"] = now + IMAGE_EXPIRY_SECONDS
+            cached_path = entry["path"]
+        elif os.path.exists(cache_file):
+            image_cache_index[h] = {
+                "path": cache_file,
+                "expires_at": now + IMAGE_EXPIRY_SECONDS,
+                "remote_url": raw_url,
+            }
+            cached_path = cache_file
+        else:
+            cached_path = None
+
+    if cached_path and os.path.exists(cached_path):
+        return send_file(cached_path)
+
+    # Not cached on disk yet: fetch from remote origin once and save
+    try:
+        headers = {
+            "User-Agent": AGENT,
+            "Referer": "https://hianime.at/",
+        }
+        resp = requests.get(raw_url, headers=headers, timeout=10)
+        if resp.status_code == 200 and resp.content:
+            # Determine content type / extension if needed
+            ct = resp.headers.get("Content-Type", "").lower()
+            if "png" in ct:
+                ext = ".png"
+            elif "webp" in ct:
+                ext = ".webp"
+            elif "gif" in ct:
+                ext = ".gif"
+            final_cache_file = os.path.join(IMAGE_CACHE_DIR, f"{h}{ext}")
+
+            # Write file atomically or directly
+            with open(final_cache_file, "wb") as f:
+                f.write(resp.content)
+
+            with image_cache_lock:
+                image_cache_index[h] = {
+                    "path": final_cache_file,
+                    "expires_at": now + IMAGE_EXPIRY_SECONDS,
+                    "remote_url": raw_url,
+                }
+
+            return Response(resp.content, mimetype=ct or "image/jpeg")
+        else:
+            return f"Failed to retrieve image: status {resp.status_code}", 502
+    except Exception as e:
+        print(f"Error fetching image for proxy ({raw_url}): {e}")
+        return "Image fetch failed", 500
+
+
 # ==========================================
 # Routes
 # ==========================================
@@ -1295,6 +1478,7 @@ def fetch_and_cache_season(year, season_str):
                         "server_code": item["server_code"],
                         "sub": item.get("sub", "?"),
                         "dub": item.get("dub", "?"),
+                        "image": item.get("image", ""),
                     }
                 )
         except Exception as e:
@@ -1318,6 +1502,7 @@ def fetch_and_cache_season(year, season_str):
                         "sub": str(item.get("sub", "?")),
                         "dub": str(item.get("dub", "?")),
                     },
+                    "image": item.get("image", ""),
                 }
             )
 
@@ -1330,6 +1515,10 @@ def fetch_and_cache_season(year, season_str):
             )
             conn.commit()
             conn.close()
+
+        # Reset expiry timer for cached images of active seasonal anime
+        all_image_urls = [it.get("image") for it in formatted_results if it.get("image")]
+        refresh_cached_images_for_urls(all_image_urls)
 
     return formatted_results
 
@@ -1402,8 +1591,11 @@ def get_seasonal():
         if row:
             cached_data = json.loads(row[0])
             # Ensure cached entries use canonical Name as _id (in case of old numeric MAL cache)
-            if cached_data and not all(
-                str(item.get("_id", "")).isdigit() for item in cached_data
+            # and include poster images (older caches predate the image field)
+            if (
+                cached_data
+                and not all(str(item.get("_id", "")).isdigit() for item in cached_data)
+                and all("image" in item for item in cached_data)
             ):
                 return jsonify({"data": cached_data})
     except Exception as e:
@@ -1578,9 +1770,11 @@ def handle_seek_sync(data):
     sync_cooldown_until = time.time() + 5.0
     emit("receive_seek", data, broadcast=True, include_self=False)
 
-# Initialize database and background thread for both Flask and Gunicorn
+# Initialize database and background threads for both Flask and Gunicorn
 init_db()
+init_image_cache_on_startup()
 socketio.start_background_task(update_current_season_loop)
+socketio.start_background_task(image_cleanup_loop)
 
 if __name__ == "__main__":
     socketio.run(
