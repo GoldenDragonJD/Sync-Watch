@@ -472,9 +472,18 @@ async function handleSearch(e) {
   }
 }
 
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function posterHtml(src, alt) {
   if (!src) return "";
-  const safeAlt = String(alt || "").replace(/"/g, "&quot;");
+  const safeAlt = escapeHtml(alt);
   const proxiedSrc = `/api/image_proxy?url=${encodeURIComponent(src)}`;
   return `<img class="card-poster" src="${proxiedSrc}" alt="${safeAlt}" loading="lazy" decoding="async" onerror="this.remove()">`;
 }
@@ -490,7 +499,7 @@ function renderSearchResults(shows) {
     shows[0].name &&
     shows[0].name.startsWith("Error:")
   ) {
-    resultsGrid.innerHTML = `<p class="text-danger" style="color: #ff4c4c; font-weight: bold; text-align: center; margin-top: 2rem;">Backend Server Issue: ${shows[0].name}</p>`;
+    resultsGrid.innerHTML = `<p class="text-danger" style="color: #ff4c4c; font-weight: bold; text-align: center; margin-top: 2rem;">Backend Server Issue: ${escapeHtml(shows[0].name)}</p>`;
     return;
   }
 
@@ -504,12 +513,12 @@ function renderSearchResults(shows) {
     const totalEps =
       subCount !== "?" ? subCount : dubCount !== "?" ? dubCount : null;
     const epsText = totalEps
-      ? `${totalEps} Episodes Available`
+      ? `${escapeHtml(totalEps)} Episodes Available`
       : "View Episodes";
 
     card.innerHTML = `
       ${posterHtml(show.image, show.name)}
-      <h3>${show.name}</h3>
+      <h3>${escapeHtml(show.name)}</h3>
       <p class="eps-text" style="color: var(--primary); font-size: 0.9rem;">${epsText}</p>
     `;
 
@@ -1202,11 +1211,11 @@ function renderSeasonal(animeList, trackerKey) {
       ${posterHtml(anime.image, title)}
       <div style="padding: 0.5rem;">
           <h4 style="margin-bottom: 0.3rem; font-size: 1rem; display: flex; align-items: center; justify-content: space-between;">
-             <span style="flex: 1;">${title}</span>
+             <span style="flex: 1;">${escapeHtml(title)}</span>
              <span class="badge-container">${badgeHtml}</span>
           </h4>
           <p class="ep-count-text" style="color: var(--primary); font-weight: bold; font-size: 0.85rem;">
-              Sub: ${subCount} | Dub: ${dubCount}
+              Sub: ${escapeHtml(subCount)} | Dub: ${escapeHtml(dubCount)}
           </p>
       </div>
     `;
@@ -1309,11 +1318,11 @@ function renderContinueWatching() {
     card.innerHTML = `
             <button type="button" class="history-delete-btn" title="Remove from watch history" aria-label="Remove from watch history">&times;</button>
             <div>
-                <h4>${item.name}</h4>
+                <h4>${escapeHtml(item.name)}</h4>
                 <p style="font-size: 0.85rem; color: var(--text-muted);">Resume watching</p>
             </div>
             <div>
-                <span class="ep-badge">Episode ${item.ep}</span>
+                <span class="ep-badge">Episode ${escapeHtml(item.ep)}</span>
             </div>
         `;
 
@@ -1321,7 +1330,13 @@ function renderContinueWatching() {
     if (deleteBtn) {
       deleteBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        deleteFromWatchHistory(item);
+        if (
+          window.confirm(
+            `Are you sure you want to remove "${item.name}" from your watch history?`,
+          )
+        ) {
+          deleteFromWatchHistory(item);
+        }
       });
     }
 

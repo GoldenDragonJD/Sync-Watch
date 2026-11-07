@@ -2,6 +2,7 @@ import base64
 import datetime
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
@@ -367,6 +368,7 @@ class HiAnimeServer(BaseAnimeServer):
             image = ""
             if m_img:
                 image = html.unescape((m_img.group(1) or m_img.group(2) or "").strip())
+                allow_image_url(image)
 
             results.append(
                 {
@@ -1168,6 +1170,12 @@ def get_stream_for_episode(anime_name, episode_string, mode="sub"):
             )
             stream_data = srv.get_stream(server_code, episode_string, mode=mode)
             if stream_data and stream_data.get("url"):
+                allow_stream_url(stream_data.get("url"))
+                allow_stream_url(stream_data.get("master_url"))
+                allow_stream_url(stream_data.get("sub_url"))
+                for sub_item in stream_data.get("subtitles") or []:
+                    if isinstance(sub_item, dict):
+                        allow_stream_url(sub_item.get("src"))
                 if stream_data.get("mal_id") and not record.get("mal_id"):
                     save_anime_mappings_batch(
                         [
@@ -1190,6 +1198,206 @@ def get_stream_for_episode(anime_name, episode_string, mode="sub"):
 
 
 # ==========================================
+# Proxy Security & SSRF Protection
+# ==========================================
+
+proxy_security_lock = threading.Lock()
+ALLOWED_STREAM_HOSTS = {
+    "dramahot.top",
+    "hls.dramahot.top",
+    "zokoanime.video",
+}
+ALLOWED_IMAGE_HOSTS = {
+    "anipixcdn.co",
+    "cdn.anipixcdn.co",
+    "myanimelist.net",
+    "cdn.myanimelist.net",
+    "hianime.at",
+    "noitatnemucod.net",
+    "cdn.noitatnemucod.net",
+}
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB cap per cached poster image
+MAX_PLAYLIST_BYTES = 5 * 1024 * 1024  # 5 MB cap for .m3u8 / .vtt text payloads
+SAFE_IMAGE_MIMETYPES = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/avif": ".avif",
+}
+SAFE_STREAM_MIMETYPES = {
+    "video/mp2t",
+    "video/mp4",
+    "video/webm",
+    "video/x-matroska",
+    "audio/aac",
+    "audio/mpeg",
+    "audio/mp4",
+    "application/octet-stream",
+    "binary/octet-stream",
+}
+SECURITY_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+}
+
+
+def _extract_clean_host(url):
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        return parsed.hostname.lower().rstrip(".")
+    except Exception:
+        return None
+
+
+def allow_stream_url(url):
+    host = _extract_clean_host(url)
+    if host:
+        with proxy_security_lock:
+            ALLOWED_STREAM_HOSTS.add(host)
+
+
+def allow_image_url(url):
+    host = _extract_clean_host(url)
+    if host:
+        with proxy_security_lock:
+            ALLOWED_IMAGE_HOSTS.add(host)
+
+
+def _is_host_in_allowlist(host, allowlist):
+    with proxy_security_lock:
+        snapshot = set(allowlist)
+    for allowed in snapshot:
+        if host == allowed or host.endswith("." + allowed):
+            return True
+    return False
+
+
+def validate_public_http_url(url, allowed_hosts=None):
+    """
+    Validates that `url` is a standard public HTTP/HTTPS URL on port 80/443,
+    matches `allowed_hosts` (if provided), and resolves exclusively to global
+    public unicast IP addresses (blocking localhost, LAN, link-local, multicast,
+    and reserved ranges against SSRF and DNS rebinding).
+    """
+    if not url or not isinstance(url, str):
+        return False, "Missing URL"
+    url = url.strip()
+    if any(ch in url for ch in ("\r", "\n", "\x00")):
+        return False, "Invalid characters in URL"
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False, "Malformed URL"
+
+    if parsed.scheme not in ("http", "https"):
+        return False, "Only http and https URLs are permitted"
+    if parsed.username or parsed.password:
+        return False, "Credentials in URL are not permitted"
+    if not parsed.hostname:
+        return False, "Missing hostname"
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return False, "Invalid port"
+    if port is not None and port not in (80, 443):
+        return False, "Non-standard ports are not permitted"
+
+    host = parsed.hostname.lower().rstrip(".")
+    if host in ("localhost", "localhost.localdomain") or host.endswith(
+        (".local", ".internal", ".lan", ".home", ".arpa")
+    ):
+        return False, "Local hostnames are not permitted"
+
+    if allowed_hosts is not None and not _is_host_in_allowlist(host, allowed_hosts):
+        return False, "Host is not in the allowed proxy list"
+
+    effective_port = port or (443 if parsed.scheme == "https" else 80)
+    try:
+        addr_info = socket.getaddrinfo(
+            host, effective_port, proto=socket.IPPROTO_TCP
+        )
+    except Exception:
+        return False, "DNS resolution failed"
+
+    if not addr_info:
+        return False, "No DNS records found"
+
+    for entry in addr_info:
+        ip_str = entry[4][0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False, "Invalid IP address"
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+            or not ip_obj.is_global
+        ):
+            return False, "Private or non-global IP addresses are forbidden"
+
+    return True, None
+
+
+def safe_upstream_get(url, headers=None, timeout=15, allowed_hosts=None, max_redirects=3):
+    """
+    Performs an HTTP GET with SSRF & host-allowlist validation on the initial
+    URL and every redirect hop (`allow_redirects=False`).
+    Returns `(response, final_url)` or raises `PermissionError` / `RuntimeError`.
+    """
+    current_url = url.strip()
+    for _ in range(max_redirects + 1):
+        ok, reason = validate_public_http_url(current_url, allowed_hosts=allowed_hosts)
+        if not ok:
+            raise PermissionError(reason)
+
+        req = requests.get(
+            current_url,
+            headers=headers,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if req.status_code in (301, 302, 303, 307, 308):
+            loc = req.headers.get("Location")
+            req.close()
+            if not loc:
+                raise RuntimeError("Redirect missing Location header")
+            current_url = urllib.parse.urljoin(current_url, loc.strip())
+            # If the initial URL was on an allowed host, allow the redirect target only if it is public
+            allowed_hosts = None
+            continue
+
+        return req, current_url
+
+    raise RuntimeError("Too many redirects")
+
+
+def _read_bounded_bytes(req, max_bytes):
+    chunks = []
+    total = 0
+    for chunk in req.iter_content(chunk_size=65536):
+        if chunk:
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("Upstream response exceeded size limit")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# ==========================================
 # Proxy Route (HLS .m3u8, Subtitles .vtt, Video Chunks)
 # ==========================================
 
@@ -1201,39 +1409,70 @@ def proxy():
     if not target_url:
         return "No URL provided", 400
 
+    safe_ref = "https://zokoanime.video/"
+    if referrer:
+        ok_ref, _ = validate_public_http_url(referrer)
+        if ok_ref:
+            safe_ref = referrer.strip()
+
     headers = {
         "User-Agent": AGENT,
-        "Referer": referrer if referrer else "https://zokoanime.video/",
+        "Referer": safe_ref,
     }
 
     range_header = request.headers.get("Range", None)
-    if range_header:
+    if range_header and re.match(r"^bytes=\d*-\d*(,\s*\d*-\d*)*$", range_header):
         headers["Range"] = range_header
 
-    req = requests.get(target_url, headers=headers, stream=True, timeout=15)
-    content_type = req.headers.get("Content-Type", "").lower()
+    try:
+        req, final_url = safe_upstream_get(
+            target_url,
+            headers=headers,
+            timeout=15,
+            allowed_hosts=ALLOWED_STREAM_HOSTS,
+        )
+    except PermissionError as e:
+        return f"Forbidden proxy target: {e}", 403
+    except Exception:
+        return "Upstream request failed", 502
+
+    content_type = req.headers.get("Content-Type", "").split(";")[0].strip().lower()
+    lower_url = urllib.parse.urlparse(final_url).path.lower()
 
     # 1. Handle WebVTT Subtitles
-    if ".vtt" in target_url.lower() or "text/vtt" in content_type:
+    if lower_url.endswith(".vtt") or content_type == "text/vtt":
+        try:
+            body = _read_bounded_bytes(req, MAX_PLAYLIST_BYTES)
+        except ValueError:
+            return "Subtitle file too large", 502
+        finally:
+            req.close()
         return Response(
-            req.content,
+            body,
             status=req.status_code,
             mimetype="text/vtt",
-            headers={"Access-Control-Allow-Origin": "*"},
+            headers=dict(SECURITY_HEADERS),
         )
 
     # 2. Handle HLS Playlist (.m3u8) Rewriting
-    if ".m3u8" in target_url.lower() or "mpegurl" in content_type:
-        content = req.text
+    if lower_url.endswith(".m3u8") or "mpegurl" in content_type:
+        try:
+            raw_bytes = _read_bounded_bytes(req, MAX_PLAYLIST_BYTES)
+        except ValueError:
+            return "Playlist too large", 502
+        finally:
+            req.close()
+
+        content = raw_bytes.decode("utf-8", errors="replace")
         new_lines = []
-        base_url = target_url.rsplit("/", 1)[0]
 
         def make_proxy_url(raw_url):
-            full_url = raw_url if raw_url.startswith("http") else f"{base_url}/{raw_url}"
+            full_url = urllib.parse.urljoin(final_url, raw_url.strip())
+            allow_stream_url(full_url)
             encoded_url = urllib.parse.quote(full_url, safe="")
             proxied = f"/proxy?url={encoded_url}"
             if referrer:
-                proxied += f"&ref={urllib.parse.quote(referrer, safe='')}"
+                proxied += f"&ref={urllib.parse.quote(safe_ref, safe='')}"
             return proxied
 
         for line in content.splitlines():
@@ -1252,18 +1491,41 @@ def proxy():
             else:
                 new_lines.append(make_proxy_url(stripped))
 
-        return Response("\n".join(new_lines), mimetype="application/vnd.apple.mpegurl")
+        return Response(
+            "\n".join(new_lines),
+            mimetype="application/vnd.apple.mpegurl",
+            headers=dict(SECURITY_HEADERS),
+        )
 
-    # 3. Stream Video Segments / MP4
+    # 3. Block dangerous non-media content types (e.g. text/html, image/svg+xml, javascript)
+    if content_type in (
+        "text/html",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "text/javascript",
+        "application/javascript",
+        "application/x-javascript",
+    ):
+        req.close()
+        return "Forbidden upstream content type", 403
+
+    out_content_type = (
+        content_type if content_type in SAFE_STREAM_MIMETYPES else "video/mp2t"
+    )
+
+    # 4. Stream Video Segments / MP4
     def generate():
-        for chunk in req.iter_content(chunk_size=1024 * 512):
-            if chunk:
-                yield chunk
+        try:
+            for chunk in req.iter_content(chunk_size=1024 * 512):
+                if chunk:
+                    yield chunk
+        finally:
+            req.close()
 
     response_headers = {
-        "Content-Type": req.headers.get("Content-Type", "video/mp2t"),
+        **SECURITY_HEADERS,
+        "Content-Type": out_content_type,
         "Accept-Ranges": "bytes",
-        "Access-Control-Allow-Origin": "*",
     }
     if "Content-Range" in req.headers:
         response_headers["Content-Range"] = req.headers["Content-Range"]
@@ -1279,6 +1541,7 @@ def image_proxy():
     if not raw_url:
         return "Missing url parameter", 400
 
+    raw_url = raw_url.strip()
     h = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()
 
     # Determine extension from url or default to .jpg
@@ -1309,43 +1572,65 @@ def image_proxy():
             cached_path = None
 
     if cached_path and os.path.exists(cached_path):
-        return send_file(cached_path)
+        resp = send_file(cached_path)
+        for k, v in SECURITY_HEADERS.items():
+            resp.headers[k] = v
+        return resp
 
-    # Not cached on disk yet: fetch from remote origin once and save
+    # Validate URL against SSRF & image host allowlist before fetching
     try:
         headers = {
             "User-Agent": AGENT,
             "Referer": "https://hianime.at/",
         }
-        resp = requests.get(raw_url, headers=headers, timeout=10)
-        if resp.status_code == 200 and resp.content:
-            # Determine content type / extension if needed
-            ct = resp.headers.get("Content-Type", "").lower()
-            if "png" in ct:
-                ext = ".png"
-            elif "webp" in ct:
-                ext = ".webp"
-            elif "gif" in ct:
-                ext = ".gif"
-            final_cache_file = os.path.join(IMAGE_CACHE_DIR, f"{h}{ext}")
-
-            # Write file atomically or directly
-            with open(final_cache_file, "wb") as f:
-                f.write(resp.content)
-
-            with image_cache_lock:
-                image_cache_index[h] = {
-                    "path": final_cache_file,
-                    "expires_at": now + IMAGE_EXPIRY_SECONDS,
-                    "remote_url": raw_url,
-                }
-
-            return Response(resp.content, mimetype=ct or "image/jpeg")
-        else:
-            return f"Failed to retrieve image: status {resp.status_code}", 502
+        resp, _ = safe_upstream_get(
+            raw_url,
+            headers=headers,
+            timeout=10,
+            allowed_hosts=ALLOWED_IMAGE_HOSTS,
+        )
+    except PermissionError as e:
+        return f"Forbidden image URL: {e}", 403
     except Exception as e:
         print(f"Error fetching image for proxy ({raw_url}): {e}")
+        return "Image fetch failed", 502
+
+    try:
+        if resp.status_code != 200:
+            return f"Failed to retrieve image: status {resp.status_code}", 502
+
+        ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ct and ct not in SAFE_IMAGE_MIMETYPES:
+            return "Unsupported image content type", 403
+
+        ext = SAFE_IMAGE_MIMETYPES.get(ct, ext)
+        img_bytes = _read_bounded_bytes(resp, MAX_IMAGE_BYTES)
+        if not img_bytes:
+            return "Empty image response", 502
+
+        final_cache_file = os.path.join(IMAGE_CACHE_DIR, f"{h}{ext}")
+        with open(final_cache_file, "wb") as f:
+            f.write(img_bytes)
+
+        with image_cache_lock:
+            image_cache_index[h] = {
+                "path": final_cache_file,
+                "expires_at": now + IMAGE_EXPIRY_SECONDS,
+                "remote_url": raw_url,
+            }
+
+        return Response(
+            img_bytes,
+            mimetype=ct if ct in SAFE_IMAGE_MIMETYPES else "image/jpeg",
+            headers=dict(SECURITY_HEADERS),
+        )
+    except ValueError:
+        return "Image exceeds maximum allowed size", 413
+    except Exception as e:
+        print(f"Error saving proxied image ({raw_url}): {e}")
         return "Image fetch failed", 500
+    finally:
+        resp.close()
 
 
 # ==========================================
@@ -1778,5 +2063,9 @@ socketio.start_background_task(image_cleanup_loop)
 
 if __name__ == "__main__":
     socketio.run(
-        app, debug=True, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True
+        app,
+        debug=os.environ.get("FLASK_DEBUG", "0") == "1",
+        host="0.0.0.0",
+        port=5000,
+        allow_unsafe_werkzeug=True,
     )
