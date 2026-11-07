@@ -1256,6 +1256,33 @@ function updateWatchHistory(showId, showName, epNum) {
   localStorage.setItem("watchHistory", JSON.stringify(history));
 }
 
+function deleteFromWatchHistory(item) {
+  if (!item) return;
+
+  let history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+  history = history.filter(
+    (h) =>
+      h.id !== item.id &&
+      !(item.name && h.name && h.name === item.name),
+  );
+  localStorage.setItem("watchHistory", JSON.stringify(history));
+
+  const prefixes = [];
+  if (item.id) prefixes.push(`save_${item.id}_`);
+  if (item.name && item.name !== item.id) prefixes.push(`save_${item.name}_`);
+
+  const keysToRemove = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && prefixes.some((prefix) => key.startsWith(prefix))) {
+      keysToRemove.push(key);
+    }
+  }
+  keysToRemove.forEach((key) => localStorage.removeItem(key));
+
+  renderContinueWatching();
+}
+
 function renderContinueWatching() {
   if (!cwContainer || !cwControls) return;
 
@@ -1280,6 +1307,7 @@ function renderContinueWatching() {
     const card = document.createElement("div");
     card.className = "history-card";
     card.innerHTML = `
+            <button type="button" class="history-delete-btn" title="Remove from watch history" aria-label="Remove from watch history">&times;</button>
             <div>
                 <h4>${item.name}</h4>
                 <p style="font-size: 0.85rem; color: var(--text-muted);">Resume watching</p>
@@ -1288,6 +1316,14 @@ function renderContinueWatching() {
                 <span class="ep-badge">Episode ${item.ep}</span>
             </div>
         `;
+
+    const deleteBtn = card.querySelector(".history-delete-btn");
+    if (deleteBtn) {
+      deleteBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteFromWatchHistory(item);
+      });
+    }
 
     card.addEventListener("click", () => {
       const showKey = item.name || item.id;
