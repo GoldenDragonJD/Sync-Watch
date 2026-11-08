@@ -4,4 +4,5 @@ playit-linux-amd64
 seasonal_cache.db
 anime_servers.sql
 image_cache/
+anime_cache/
 __pycache__/

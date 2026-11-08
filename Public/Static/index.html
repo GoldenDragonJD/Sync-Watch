@@ -5,12 +5,28 @@
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>SyncStream - Watch Together</title>
         <link rel="stylesheet" href="/style" />
-        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-        <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+        <script src="/vendor/hls.min.js"></script>
+        <script src="/vendor/socket.io.min.js"></script>
     </head>
     <body>
         <header class="app-header">
-            <h1 class="logo">Sync<span>Stream</span></h1>
+            <h1 class="logo" id="logo-home-btn" style="cursor: pointer" title="Go to Main Window">
+                Sync<span>Stream</span>
+            </h1>
+
+            <nav class="window-nav" aria-label="Window Switcher">
+                <button type="button" id="nav-main-btn" class="nav-tab-btn active">
+                    🌐 Main Window
+                </button>
+                <button type="button" id="nav-library-btn" class="nav-tab-btn">
+                    📚 Local Library
+                    <span id="library-count-badge" class="nav-badge hidden">0</span>
+                </button>
+                <button type="button" id="nav-downloads-btn" class="nav-tab-btn">
+                    ⬇ Downloads
+                    <span id="downloads-active-badge" class="nav-badge hidden">0</span>
+                </button>
+            </nav>
 
             <div class="sync-toggle-container">
                 <span class="sync-label">Watch Party Sync</span>
@@ -22,6 +38,7 @@
         </header>
 
         <main id="app-container">
+            <!-- MAIN WINDOW (Online Search & Seasonal Schedule) -->
             <section id="search-view" class="view active">
                 <div class="search-container">
                     <h2>What do you want to watch?</h2>
@@ -75,12 +92,85 @@
                 <div id="results-grid" class="grid"></div>
             </section>
 
+            <!-- LOCAL LIBRARY WINDOW (Offline Cached Anime & Device Storage Status) -->
+            <section id="library-view" class="view hidden">
+                <div class="storage-status-banner" id="storage-status-banner">
+                    <div class="storage-status-top">
+                        <div class="storage-title-group">
+                            <span class="storage-icon">💾</span>
+                            <div>
+                                <h3>Device Storage Status</h3>
+                                <p id="storage-detail-subtext">
+                                    Checking available disk space...
+                                </p>
+                            </div>
+                        </div>
+                        <div class="storage-stats-pills">
+                            <div class="storage-pill free-pill">
+                                <span class="pill-label">Space Left on Device</span>
+                                <span class="pill-value" id="storage-free-value">-- GB</span>
+                            </div>
+                            <div class="storage-pill cache-pill">
+                                <span class="pill-label">Cached Anime Library</span>
+                                <span class="pill-value" id="storage-cache-value">0 MB</span>
+                            </div>
+                            <div class="storage-pill total-pill">
+                                <span class="pill-label">Total Device Usage</span>
+                                <span class="pill-value" id="storage-total-value">-- / -- GB</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="storage-bar-track" title="Device Disk Usage">
+                        <div id="storage-bar-system" class="storage-bar-fill system-fill" style="width: 0%"></div>
+                        <div id="storage-bar-cache" class="storage-bar-fill cache-fill" style="width: 0%"></div>
+                    </div>
+                    <div class="storage-legend">
+                        <span><i class="legend-dot system-dot"></i> System & Other Files</span>
+                        <span><i class="legend-dot cache-dot"></i> Cached Anime</span>
+                        <span><i class="legend-dot free-dot"></i> Free Space Available</span>
+                    </div>
+                </div>
+
+                <div class="search-container" style="margin-bottom: 2rem">
+                    <h2>Local Offline Library</h2>
+                    <p style="color: var(--text-muted); margin-bottom: 1rem; font-size: 0.95rem">
+                        Anime cached here can be streamed directly on the website without an internet connection, or exported to your local player.
+                    </p>
+                    <div class="library-search-bar">
+                        <input
+                            type="text"
+                            id="library-search-input"
+                            placeholder="Filter your cached anime library..."
+                            autocomplete="off"
+                        />
+                    </div>
+                </div>
+
+                <div id="library-empty-state" class="library-empty-state hidden">
+                    <div class="empty-icon">🎒</div>
+                    <h3>Your Offline Library is Empty</h3>
+                    <p>
+                        Hover over any anime on the <b>Main Window</b> and click <b>⬇ Download</b>, or open an anime and choose episodes to cache for your trip!
+                    </p>
+                    <button type="button" id="library-browse-btn" style="margin-top: 1rem">
+                        Browse Anime to Cache
+                    </button>
+                </div>
+
+                <div id="library-grid" class="grid"></div>
+            </section>
+
+            <!-- WATCH / PLAYER WINDOW -->
             <section id="watch-view" class="view hidden">
                 <div class="player-header">
                     <button id="back-btn" class="secondary-btn">
                         ← Back to Search
                     </button>
-                    <h2 id="current-show-title">Show Title</h2>
+                    <div class="player-title-group">
+                        <h2 id="current-show-title">Show Title</h2>
+                        <span id="watch-cached-badge" class="cached-badge hidden">✓ CACHED</span>
+                        <span id="watch-offline-playing-badge" class="offline-stream-badge hidden">⚡ Streaming from Local Cache</span>
+                    </div>
                 </div>
 
                 <div class="layout-wrapper">
@@ -189,18 +279,168 @@
                     </div>
 
                     <div class="episode-sidebar">
-                        <h3>Episodes</h3>
-                        <div class="episode-controls">
-                            <select id="dub-sub-toggle">
+                        <div class="sidebar-top-row">
+                            <h3>Episodes</h3>
+                            <select id="dub-sub-toggle" style="width: auto; min-width: 100px">
                                 <option value="sub">Sub</option>
                                 <option value="dub">Dub</option>
                             </select>
                         </div>
+
+                        <!-- Download & Offline Cache Controls on Player Screen -->
+                        <div class="player-download-panel">
+                            <div class="dl-mode-selector-label">Download / Cache Mode:</div>
+                            <div class="dl-target-switch" role="group" aria-label="Download Option">
+                                <button
+                                    type="button"
+                                    id="player-target-cache-btn"
+                                    class="dl-target-btn active"
+                                    data-target="cache"
+                                    title="Cache on website to stream offline without internet"
+                                >
+                                    🌐 Website Cache
+                                </button>
+                                <button
+                                    type="button"
+                                    id="player-target-local-btn"
+                                    class="dl-target-btn"
+                                    data-target="local"
+                                    title="Download MP4 file to your device for your own video player"
+                                >
+                                    💻 Local Player (.mp4)
+                                </button>
+                            </div>
+
+                            <div class="player-dl-actions">
+                                <button
+                                    type="button"
+                                    id="dl-all-eps-btn"
+                                    class="dl-btn primary-dl"
+                                    title="Download all available episodes"
+                                >
+                                    ⬇ Download All
+                                </button>
+                                <button
+                                    type="button"
+                                    id="dl-current-ep-btn"
+                                    class="dl-btn"
+                                    title="Download currently playing episode"
+                                >
+                                    ⬇ Ep <span id="dl-current-ep-label">1</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    id="toggle-select-eps-btn"
+                                    class="dl-btn"
+                                    title="Choose specific episodes from the grid below to download"
+                                >
+                                    ☑ Choose Episodes
+                                </button>
+                            </div>
+
+                            <div id="ep-selection-bar" class="ep-selection-bar hidden">
+                                <div class="ep-sel-helpers">
+                                    <span>Click episodes below to select:</span>
+                                    <div class="ep-sel-mini-btns">
+                                        <button type="button" id="sel-all-eps-btn" class="mini-link-btn">All</button>
+                                        <button type="button" id="sel-uncached-eps-btn" class="mini-link-btn">Uncached</button>
+                                        <button type="button" id="sel-clear-eps-btn" class="mini-link-btn">Clear</button>
+                                    </div>
+                                </div>
+                                <button type="button" id="dl-selected-confirm-btn" class="dl-btn primary-dl" style="width: 100%">
+                                    ⬇ Download Selected (<span id="sel-ep-count">0</span>)
+                                </button>
+                            </div>
+                        </div>
+
                         <div id="episode-grid" class="ep-grid"></div>
                     </div>
                 </div>
             </section>
         </main>
+
+        <!-- QUICK DOWNLOAD & CACHE MODAL (From Home Screen Hover or Card) -->
+        <div id="download-modal-backdrop" class="modal-backdrop hidden">
+            <div class="download-modal" role="dialog" aria-modal="true" aria-labelledby="dl-modal-title">
+                <div class="modal-header">
+                    <div>
+                        <h3 id="dl-modal-title">Download / Cache Anime</h3>
+                        <p id="dl-modal-subtitle" style="color: var(--text-muted); font-size: 0.85rem">
+                            Choose how you want to save this anime for your trip
+                        </p>
+                    </div>
+                    <button type="button" id="close-dl-modal-btn" class="modal-close-btn" aria-label="Close">&times;</button>
+                </div>
+
+                <div class="modal-body">
+                    <div class="dl-option-cards">
+                        <label class="dl-option-card active" id="modal-opt-cache-card">
+                            <input type="radio" name="modal-dl-target" value="cache" checked />
+                            <div class="dl-opt-icon">🌐</div>
+                            <div class="dl-opt-info">
+                                <h4>Cache on Website (Offline Library)</h4>
+                                <p>Stream directly on SyncStream anytime without an internet connection. Shows up in your Local Library.</p>
+                            </div>
+                        </label>
+
+                        <label class="dl-option-card" id="modal-opt-local-card">
+                            <input type="radio" name="modal-dl-target" value="local" />
+                            <div class="dl-opt-icon">💻</div>
+                            <div class="dl-opt-info">
+                                <h4>Download to Device (Local Player)</h4>
+                                <p>Saves standard .mp4 video file(s) to your computer/device to play in VLC, MPV, or your own player.</p>
+                            </div>
+                        </label>
+                    </div>
+
+                    <div class="modal-controls-row">
+                        <div class="modal-lang-group">
+                            <label for="modal-lang-select">Audio / Subtitles:</label>
+                            <select id="modal-lang-select">
+                                <option value="sub">Subtitled (SUB)</option>
+                                <option value="dub">English Dub (DUB)</option>
+                            </select>
+                        </div>
+
+                        <div class="modal-ep-filter-btns">
+                            <button type="button" id="modal-sel-all-btn" class="secondary-btn mini-btn">Select All</button>
+                            <button type="button" id="modal-sel-uncached-btn" class="secondary-btn mini-btn">Select Uncached</button>
+                            <button type="button" id="modal-sel-none-btn" class="secondary-btn mini-btn">Clear</button>
+                        </div>
+                    </div>
+
+                    <div id="modal-episodes-status" class="modal-episodes-status">
+                        Loading available episodes...
+                    </div>
+                    <div id="modal-episode-grid" class="ep-grid modal-ep-grid"></div>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" id="modal-dl-selected-btn" class="secondary-btn">
+                        ⬇ Download Selected (<span id="modal-sel-count">0</span>)
+                    </button>
+                    <button type="button" id="modal-dl-all-btn" class="primary-btn">
+                        ⬇ Download All Episodes
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- DOWNLOAD MANAGER DRAWER -->
+        <aside id="downloads-drawer" class="downloads-drawer hidden" aria-label="Downloads Queue">
+            <div class="drawer-header">
+                <h3>⬇ Downloads & Caching Queue</h3>
+                <div class="drawer-header-actions">
+                    <button type="button" id="clear-completed-dl-btn" class="mini-link-btn" title="Clear finished jobs">
+                        Clear Done
+                    </button>
+                    <button type="button" id="close-drawer-btn" class="modal-close-btn" aria-label="Close">&times;</button>
+                </div>
+            </div>
+            <div id="downloads-list" class="downloads-list">
+                <p class="empty-dl-msg">No active downloads.</p>
+            </div>
+        </aside>
 
         <script src="/logic"></script>
     </body>

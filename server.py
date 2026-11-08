@@ -1,17 +1,23 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import hashlib
 import html
 import ipaddress
 import json
 import os
+import queue
 import re
+import shutil
 import socket
 import sqlite3
 import ssl
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 import requests
 from flask import Flask, Response, jsonify, request, send_file
 from flask_socketio import SocketIO, emit
@@ -23,7 +29,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "seasonal_cache.db")
 SQL_FILE_PATH = os.path.join(BASE_DIR, "anime_servers.sql")
 IMAGE_CACHE_DIR = os.path.join(BASE_DIR, "image_cache")
+ANIME_CACHE_DIR = os.path.join(BASE_DIR, "anime_cache")
+LIBRARY_CACHE_DIR = os.path.join(ANIME_CACHE_DIR, "library")
+EXPORT_CACHE_DIR = os.path.join(ANIME_CACHE_DIR, "exports")
 os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+os.makedirs(LIBRARY_CACHE_DIR, exist_ok=True)
+os.makedirs(EXPORT_CACHE_DIR, exist_ok=True)
 db_lock = threading.Lock()
 
 # Image cache in-memory tracking & policies
@@ -634,6 +645,34 @@ def init_db():
                (year INTEGER, season TEXT, data TEXT, last_updated REAL,
                 PRIMARY KEY (year, season))"""
         )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS cached_anime (
+                anime_name TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                image_url TEXT,
+                poster_path TEXT,
+                mal_id INTEGER,
+                sub_episodes_json TEXT,
+                dub_episodes_json TEXT,
+                added_at REAL,
+                updated_at REAL
+            )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS cached_episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anime_name TEXT NOT NULL,
+                episode_num TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                video_path TEXT NOT NULL,
+                subtitle_path TEXT,
+                file_size INTEGER DEFAULT 0,
+                skip_json TEXT,
+                mal_id INTEGER,
+                cached_at REAL,
+                UNIQUE(anime_name, episode_num, mode)
+            )"""
+        )
 
         if os.path.exists(SQL_FILE_PATH):
             with open(SQL_FILE_PATH, "r", encoding="utf-8") as f:
@@ -1128,31 +1167,130 @@ def search_anime(query, mode="sub"):
     return search_db_anime(query)
 
 
-def get_episodes(anime_name):
-    record = resolve_anime_servers(anime_name)
-    if not record or not record.get("servers"):
-        return {"sub": [], "dub": []}
-
-    for srv_name, srv in ANIME_SERVERS.items():
-        server_code = record["servers"].get(srv_name)
-        if not server_code:
-            continue
+def _sort_ep_list(ep_list):
+    def _key(val):
         try:
-            print(
-                f"--- Fetching episodes for '{record['name']}' -> {srv_name} -> {server_code} ---"
-            )
-            if isinstance(srv, HiAnimeServer):
-                eps = srv.get_episodes(
-                    server_code, cached_dub_count=record.get("dub_episodes")
-                )
-            else:
-                eps = srv.get_episodes(server_code)
-            if eps and (eps.get("sub") or eps.get("dub")):
-                return eps
-        except Exception as e:
-            print(f"Episodes error on {srv_name} ({server_code}): {e}")
+            return (0, float(val), str(val))
+        except Exception:
+            return (1, 0.0, str(val))
 
-    return {"sub": [], "dub": []}
+    seen = []
+    seen_set = set()
+    for x in ep_list:
+        s = str(x)
+        if s not in seen_set:
+            seen_set.add(s)
+            seen.append(s)
+    return sorted(seen, key=_key)
+
+
+def get_cached_episodes_for_anime(anime_name):
+    record = lookup_anime_in_db(anime_name)
+    canonical = record["name"] if record else str(anime_name).strip()
+    candidates = {canonical, str(anime_name).strip()}
+    sub_cached = []
+    dub_cached = []
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        placeholders = ",".join("?" for _ in candidates)
+        c.execute(
+            f"SELECT episode_num, mode, video_path FROM cached_episodes WHERE anime_name IN ({placeholders})",
+            tuple(candidates),
+        )
+        rows = c.fetchall()
+        conn.close()
+    for ep_num, mode, vpath in rows:
+        if vpath and os.path.exists(vpath):
+            if mode == "dub":
+                dub_cached.append(str(ep_num))
+            else:
+                sub_cached.append(str(ep_num))
+    return {"sub": _sort_ep_list(sub_cached), "dub": _sort_ep_list(dub_cached)}
+
+
+def get_episodes(anime_name):
+    cached_eps = get_cached_episodes_for_anime(anime_name)
+    record = resolve_anime_servers(anime_name)
+    canonical = record["name"] if record else str(anime_name).strip()
+
+    live_eps = None
+    if record and record.get("servers"):
+        for srv_name, srv in ANIME_SERVERS.items():
+            server_code = record["servers"].get(srv_name)
+            if not server_code:
+                continue
+            try:
+                print(
+                    f"--- Fetching episodes for '{record['name']}' -> {srv_name} -> {server_code} ---"
+                )
+                if isinstance(srv, HiAnimeServer):
+                    eps = srv.get_episodes(
+                        server_code, cached_dub_count=record.get("dub_episodes")
+                    )
+                else:
+                    eps = srv.get_episodes(server_code)
+                if eps and (eps.get("sub") or eps.get("dub")):
+                    live_eps = eps
+                    break
+            except Exception as e:
+                print(f"Episodes error on {srv_name} ({server_code}): {e}")
+
+    if live_eps:
+        sub_list = [str(x) for x in (live_eps.get("sub") or [])]
+        dub_list = [str(x) for x in (live_eps.get("dub") or [])]
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute(
+                "UPDATE cached_anime SET sub_episodes_json = ?, dub_episodes_json = ?, updated_at = ? WHERE anime_name = ?",
+                (json.dumps(sub_list), json.dumps(dub_list), time.time(), canonical),
+            )
+            conn.commit()
+            conn.close()
+        return {
+            "sub": sub_list,
+            "dub": dub_list,
+            "cached": cached_eps,
+        }
+
+    # Offline fallback: use stored episode lists in cached_anime or cached_episodes
+    stored_sub = []
+    stored_dub = []
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT sub_episodes_json, dub_episodes_json FROM cached_anime WHERE anime_name IN (?, ?)",
+            (canonical, str(anime_name).strip()),
+        )
+        row = c.fetchone()
+        conn.close()
+    if row:
+        try:
+            stored_sub = json.loads(row[0] or "[]")
+        except Exception:
+            stored_sub = []
+        try:
+            stored_dub = json.loads(row[1] or "[]")
+        except Exception:
+            stored_dub = []
+
+    merged_sub = _sort_ep_list(list(stored_sub) + cached_eps["sub"])
+    merged_dub = _sort_ep_list(list(stored_dub) + cached_eps["dub"])
+
+    # Also fallback to episode count in anime table if still empty
+    if not merged_sub and record and str(record.get("sub_episodes", "?")).isdigit():
+        merged_sub = [str(i) for i in range(1, int(record["sub_episodes"]) + 1)]
+    if not merged_dub and record and str(record.get("dub_episodes", "?")).isdigit():
+        merged_dub = [str(i) for i in range(1, int(record["dub_episodes"]) + 1)]
+
+    return {
+        "sub": merged_sub,
+        "dub": merged_dub,
+        "cached": cached_eps,
+        "offline": True,
+    }
 
 
 def get_stream_for_episode(anime_name, episode_string, mode="sub"):
@@ -1634,6 +1772,744 @@ def image_proxy():
 
 
 # ==========================================
+# Offline Library & Download Manager
+# ==========================================
+
+download_lock = threading.Lock()
+# Maps job_id -> job dict
+download_jobs = {}
+download_queue = queue.Queue()
+
+
+def _safe_filename(name):
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(name or "anime")).strip(" .")
+    return (cleaned[:120] or "anime")
+
+
+def _safe_anime_slug(anime_name):
+    base = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(anime_name or "anime").strip()).strip("_")
+    h = hashlib.sha256(str(anime_name or "anime").encode("utf-8")).hexdigest()[:10]
+    return f"{(base[:60] or 'anime')}_{h}"
+
+
+def get_cached_episode_record(anime_name, episode_string, mode="sub"):
+    rec = lookup_anime_in_db(anime_name)
+    canonical = rec["name"] if rec else str(anime_name).strip()
+    candidates = (canonical, str(anime_name).strip())
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """SELECT id, anime_name, episode_num, mode, video_path, subtitle_path, file_size, skip_json, mal_id
+               FROM cached_episodes
+               WHERE anime_name IN (?, ?) AND episode_num = ? AND mode = ?
+               LIMIT 1""",
+            (candidates[0], candidates[1], str(episode_string), str(mode)),
+        )
+        row = c.fetchone()
+        conn.close()
+    if not row:
+        return None
+    video_path = row[4]
+    if not video_path or not os.path.exists(video_path):
+        return None
+    return {
+        "id": row[0],
+        "anime_name": row[1],
+        "episode_num": row[2],
+        "mode": row[3],
+        "video_path": video_path,
+        "subtitle_path": row[5] if (row[5] and os.path.exists(row[5])) else None,
+        "file_size": row[6] or 0,
+        "skip_json": row[7],
+        "mal_id": row[8],
+    }
+
+
+def get_storage_status():
+    try:
+        usage = shutil.disk_usage(ANIME_CACHE_DIR)
+        total_bytes = usage.total
+        used_bytes = usage.used
+        free_bytes = usage.free
+    except Exception:
+        total_bytes = 0
+        used_bytes = 0
+        free_bytes = 0
+
+    cache_bytes = 0
+    cached_anime_names = set()
+    cached_episodes_count = 0
+
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT anime_name, video_path, subtitle_path, file_size FROM cached_episodes")
+        rows = c.fetchall()
+        conn.close()
+
+    for anime_name, vpath, spath, fsize in rows:
+        if vpath and os.path.exists(vpath):
+            cached_anime_names.add(anime_name)
+            cached_episodes_count += 1
+            try:
+                actual_size = os.path.getsize(vpath)
+            except Exception:
+                actual_size = fsize or 0
+            cache_bytes += actual_size
+            if spath and os.path.exists(spath):
+                try:
+                    cache_bytes += os.path.getsize(spath)
+                except Exception:
+                    pass
+
+    used_pct = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else 0.0
+    free_pct = round((free_bytes / total_bytes) * 100, 1) if total_bytes > 0 else 0.0
+    cache_pct = round((cache_bytes / total_bytes) * 100, 2) if total_bytes > 0 else 0.0
+
+    return {
+        "total_bytes": total_bytes,
+        "used_bytes": used_bytes,
+        "free_bytes": free_bytes,
+        "cache_bytes": cache_bytes,
+        "used_percent": used_pct,
+        "free_percent": free_pct,
+        "cache_percent": cache_pct,
+        "cached_anime_count": len(cached_anime_names),
+        "cached_episodes_count": cached_episodes_count,
+    }
+
+
+def get_library_data():
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """SELECT anime_name, display_name, image_url, poster_path, mal_id, sub_episodes_json, dub_episodes_json, updated_at
+               FROM cached_anime
+               ORDER BY updated_at DESC"""
+        )
+        anime_rows = {r[0]: r for r in c.fetchall()}
+
+        c.execute(
+            """SELECT id, anime_name, episode_num, mode, video_path, subtitle_path, file_size, cached_at
+               FROM cached_episodes
+               ORDER BY cached_at DESC"""
+        )
+        ep_rows = c.fetchall()
+
+        # Also fetch alt_names and episode counts from anime table
+        c.execute("SELECT id, name, sub_episodes, dub_episodes FROM anime")
+        db_anime_info = {r[1]: r for r in c.fetchall()}
+        c.execute("SELECT anime_id, alt_name FROM anime_alt_names")
+        alt_by_id = {}
+        for aid, aname in c.fetchall():
+            alt_by_id.setdefault(aid, []).append(aname)
+        conn.close()
+
+    by_anime = {}
+    for ep_id, anime_name, ep_num, mode, vpath, spath, fsize, cached_at in ep_rows:
+        if not vpath or not os.path.exists(vpath):
+            continue
+        try:
+            real_size = os.path.getsize(vpath)
+        except Exception:
+            real_size = fsize or 0
+
+        entry = by_anime.setdefault(
+            anime_name,
+            {
+                "sub": [],
+                "dub": [],
+                "episode_records": [],
+                "total_size_bytes": 0,
+                "latest_cached_at": 0.0,
+            },
+        )
+        if mode == "dub":
+            entry["dub"].append(str(ep_num))
+        else:
+            entry["sub"].append(str(ep_num))
+        entry["total_size_bytes"] += real_size
+        if (cached_at or 0) > entry["latest_cached_at"]:
+            entry["latest_cached_at"] = cached_at or 0
+        entry["episode_records"].append(
+            {
+                "id": ep_id,
+                "episode_num": str(ep_num),
+                "mode": mode,
+                "file_size": real_size,
+                "has_subtitle": bool(spath and os.path.exists(spath)),
+                "cached_at": cached_at,
+            }
+        )
+
+    library_list = []
+    cached_map = {}
+
+    for anime_name, info in by_anime.items():
+        sub_eps = _sort_ep_list(info["sub"])
+        dub_eps = _sort_ep_list(info["dub"])
+        total_eps_cached = len(sub_eps) + len(dub_eps)
+        if total_eps_cached == 0:
+            continue
+
+        meta = anime_rows.get(anime_name)
+        display_name = meta[1] if meta and meta[1] else anime_name
+        image_url = meta[2] if meta else ""
+        poster_path = meta[3] if meta else None
+        has_local_poster = bool(poster_path and os.path.exists(poster_path))
+
+        db_row = db_anime_info.get(anime_name)
+        avail_sub = str(db_row[2]) if db_row and db_row[2] and db_row[2] != "?" else str(len(sub_eps) or "?")
+        avail_dub = str(db_row[3]) if db_row and db_row[3] and db_row[3] != "?" else str(len(dub_eps) or "0")
+        alts = alt_by_id.get(db_row[0], [anime_name]) if db_row else [anime_name]
+
+        poster_url = (
+            f"/api/library/poster/{urllib.parse.quote(anime_name, safe='')}"
+            if has_local_poster
+            else (f"/api/image_proxy?url={urllib.parse.quote(image_url, safe='')}" if image_url else "")
+        )
+
+        item_obj = {
+            "_id": anime_name,
+            "name": display_name,
+            "alt_names": alts,
+            "image": image_url,
+            "poster_url": poster_url,
+            "is_cached": True,
+            "cached_episodes": {
+                "sub": sub_eps,
+                "dub": dub_eps,
+            },
+            "cached_count": total_eps_cached,
+            "total_size_bytes": info["total_size_bytes"],
+            "latest_cached_at": info["latest_cached_at"],
+            "availableEpisodes": {
+                "sub": avail_sub,
+                "dub": avail_dub,
+            },
+        }
+        library_list.append(item_obj)
+
+        summary = {
+            "sub": sub_eps,
+            "dub": dub_eps,
+            "total": total_eps_cached,
+            "size_bytes": info["total_size_bytes"],
+        }
+        cached_map[anime_name] = summary
+        cached_map[normalize_name(anime_name)] = summary
+        for alt in alts:
+            cached_map[alt] = summary
+            cached_map[normalize_name(alt)] = summary
+
+    library_list.sort(key=lambda x: x.get("latest_cached_at", 0), reverse=True)
+
+    return {
+        "storage": get_storage_status(),
+        "anime": library_list,
+        "cached_map": cached_map,
+    }
+
+
+def _find_anime_image_url(anime_name, provided_image=""):
+    if provided_image and str(provided_image).startswith("http"):
+        return provided_image.strip()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT image_url FROM cached_anime WHERE anime_name = ?", (anime_name,))
+        row = c.fetchone()
+        if row and row[0]:
+            conn.close()
+            return row[0]
+        c.execute("SELECT data FROM seasonal_cache ORDER BY last_updated DESC LIMIT 4")
+        srows = c.fetchall()
+        conn.close()
+    norm_target = normalize_name(anime_name)
+    for (sdata,) in srows:
+        try:
+            items = json.loads(sdata)
+            for it in items:
+                if normalize_name(it.get("name")) == norm_target or normalize_name(it.get("_id")) == norm_target:
+                    if it.get("image"):
+                        return it["image"]
+        except Exception:
+            pass
+    return ""
+
+
+def _cache_poster_file(anime_name, image_url, anime_dir):
+    if not image_url or not image_url.startswith("http"):
+        return None
+    os.makedirs(anime_dir, exist_ok=True)
+    h = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    # Check if already in image_cache
+    for ext in [".jpg", ".jpeg", ".png", ".webp", ".avif"]:
+        cand = os.path.join(IMAGE_CACHE_DIR, f"{h}{ext}")
+        if os.path.exists(cand):
+            dest = os.path.join(anime_dir, f"poster{ext}")
+            try:
+                shutil.copyfile(cand, dest)
+                return dest
+            except Exception:
+                pass
+    try:
+        allow_image_url(image_url)
+        headers = {"User-Agent": AGENT, "Referer": "https://hianime.at/"}
+        resp, _ = safe_upstream_get(image_url, headers=headers, timeout=10, allowed_hosts=ALLOWED_IMAGE_HOSTS)
+        try:
+            if resp.status_code == 200:
+                ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                ext = SAFE_IMAGE_MIMETYPES.get(ct, ".jpg")
+                img_bytes = _read_bounded_bytes(resp, MAX_IMAGE_BYTES)
+                if img_bytes:
+                    dest = os.path.join(anime_dir, f"poster{ext}")
+                    with open(dest, "wb") as f:
+                        f.write(img_bytes)
+                    return dest
+        finally:
+            resp.close()
+    except Exception as e:
+        print(f"Could not cache poster for {anime_name}: {e}")
+    return None
+
+
+def _fetch_aniskip_for_cache(mal_id, ep_num):
+    if not mal_id:
+        return None
+    try:
+        url = f"https://api.aniskip.com/v2/skip-times/{int(mal_id)}/{urllib.parse.quote(str(ep_num))}?types=op&types=ed&types=mixed-op&types=mixed-ed&types=recap&episodeLength=0"
+        resp = requests.get(url, headers={"User-Agent": AGENT}, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("found") and data.get("results"):
+                skip_obj = {}
+                for r in data["results"]:
+                    stype = r.get("skipType")
+                    interval = r.get("interval") or {}
+                    if stype in ("op", "mixed-op") and "intro" not in skip_obj:
+                        skip_obj["intro"] = {
+                            "start": interval.get("startTime", 0),
+                            "end": interval.get("endTime", 0),
+                        }
+                    elif stype in ("ed", "mixed-ed") and "outro" not in skip_obj:
+                        skip_obj["outro"] = {
+                            "start": interval.get("startTime", 0),
+                            "end": interval.get("endTime", 0),
+                        }
+                if skip_obj:
+                    return skip_obj
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_upstream_bytes(url, referer, timeout=20):
+    headers = {
+        "User-Agent": AGENT,
+        "Referer": referer or "https://zokoanime.video/",
+    }
+    allow_stream_url(url)
+    for attempt in range(3):
+        try:
+            req, _ = safe_upstream_get(
+                url,
+                headers=headers,
+                timeout=timeout,
+                allowed_hosts=ALLOWED_STREAM_HOSTS,
+            )
+            try:
+                if req.status_code // 100 == 2:
+                    return req.content
+            finally:
+                req.close()
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(f"Failed to download segment: {url}")
+
+
+def _parse_and_download_hls_playlist(playlist_url, referer, out_ts_path, progress_cb=None, cancel_cb=None):
+    raw_bytes = _fetch_upstream_bytes(playlist_url, referer, timeout=15)
+    playlist_text = raw_bytes.decode("utf-8", errors="replace")
+
+    lines = [ln.strip() for ln in playlist_text.splitlines() if ln.strip()]
+
+    # Check if this is still a master playlist
+    if any(ln.startswith("#EXT-X-STREAM-INF") for ln in lines):
+        variants = []
+        for i, ln in enumerate(lines):
+            if ln.startswith("#EXT-X-STREAM-INF") and "EXT-X-I-FRAME" not in ln:
+                m_res = re.search(r"RESOLUTION=\d+x(\d+)", ln)
+                res_h = int(m_res.group(1)) if m_res else 0
+                if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                    v_url = urllib.parse.urljoin(playlist_url, lines[i + 1])
+                    variants.append((res_h, v_url))
+        if variants:
+            variants.sort(key=lambda x: x[0], reverse=True)
+            return _parse_and_download_hls_playlist(
+                variants[0][1], referer, out_ts_path, progress_cb, cancel_cb
+            )
+
+    init_map_url = None
+    segment_urls = []
+    for ln in lines:
+        if ln.startswith("#EXT-X-MAP:") and 'URI="' in ln:
+            m = re.search(r'URI="([^"]+)"', ln)
+            if m:
+                init_map_url = urllib.parse.urljoin(playlist_url, m.group(1))
+        elif not ln.startswith("#"):
+            segment_urls.append(urllib.parse.urljoin(playlist_url, ln))
+
+    if not segment_urls:
+        raise RuntimeError("No video segments found in HLS playlist")
+
+    total_segments = len(segment_urls)
+    completed_segments = 0
+    downloaded_bytes = 0
+    seg_Lock = threading.Lock()
+
+    if progress_cb:
+        progress_cb(0, total_segments, 0)
+
+    init_bytes = b""
+    if init_map_url:
+        init_bytes = _fetch_upstream_bytes(init_map_url, referer, timeout=20)
+        downloaded_bytes += len(init_bytes)
+
+    # Download segments in batches to keep memory bounded while maximizing speed
+    BATCH_SIZE = 24
+    with open(out_ts_path, "wb") as out_f:
+        if init_bytes:
+            out_f.write(init_bytes)
+
+        for batch_start in range(0, total_segments, BATCH_SIZE):
+            if cancel_cb and cancel_cb():
+                raise InterruptedError("Download cancelled")
+
+            batch = segment_urls[batch_start : batch_start + BATCH_SIZE]
+            batch_results = [None] * len(batch)
+
+            def _dl_one(idx, s_url):
+                if cancel_cb and cancel_cb():
+                    raise InterruptedError("Download cancelled")
+                data = _fetch_upstream_bytes(s_url, referer, timeout=25)
+                return idx, data
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(_dl_one, i, u) for i, u in enumerate(batch)]
+                for fut in as_completed(futures):
+                    if cancel_cb and cancel_cb():
+                        raise InterruptedError("Download cancelled")
+                    idx, data = fut.result()
+                    batch_results[idx] = data
+                    with seg_Lock:
+                        completed_segments += 1
+                        downloaded_bytes += len(data)
+                        if progress_cb:
+                            progress_cb(completed_segments, total_segments, downloaded_bytes)
+
+            for chunk_bytes in batch_results:
+                if chunk_bytes:
+                    out_f.write(chunk_bytes)
+
+    return total_segments, downloaded_bytes
+
+
+def download_hls_episode_to_mp4(stream_data, out_mp4_path, out_vtt_path=None, progress_cb=None, cancel_cb=None):
+    stream_url = stream_data["url"]
+    referer = stream_data.get("referrer") or "https://zokoanime.video/"
+    sub_url = stream_data.get("sub_url")
+
+    # Download subtitle if available
+    has_sub = False
+    if sub_url and out_vtt_path:
+        try:
+            sub_bytes = _fetch_upstream_bytes(sub_url, referer, timeout=15)
+            if sub_bytes:
+                with open(out_vtt_path, "wb") as sf:
+                    sf.write(sub_bytes)
+                has_sub = True
+        except Exception as e:
+            print(f"Warning: subtitle download failed ({sub_url}): {e}")
+
+    with tempfile.TemporaryDirectory(dir=ANIME_CACHE_DIR) as tmpdir:
+        temp_ts = os.path.join(tmpdir, "video.ts")
+        total_segs, dl_bytes = _parse_and_download_hls_playlist(
+            stream_url, referer, temp_ts, progress_cb=progress_cb, cancel_cb=cancel_cb
+        )
+
+        if cancel_cb and cancel_cb():
+            raise InterruptedError("Download cancelled")
+
+        temp_mp4 = os.path.join(tmpdir, "remuxed.mp4")
+
+        remuxed_ok = False
+        if has_sub and out_vtt_path and os.path.exists(out_vtt_path):
+            cmd_with_sub = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                temp_ts,
+                "-i",
+                out_vtt_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                "-c:s",
+                "mov_text",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-movflags",
+                "+faststart",
+                temp_mp4,
+            ]
+            res = subprocess.run(cmd_with_sub, capture_output=True, text=True)
+            if res.returncode == 0 and os.path.exists(temp_mp4) and os.path.getsize(temp_mp4) > 0:
+                remuxed_ok = True
+
+        if not remuxed_ok:
+            cmd_no_sub = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                temp_ts,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                temp_mp4,
+            ]
+            res = subprocess.run(cmd_no_sub, capture_output=True, text=True)
+            if res.returncode != 0 or not os.path.exists(temp_mp4):
+                raise RuntimeError(f"FFmpeg remux failed: {res.stderr[-300:] if res.stderr else 'unknown error'}")
+
+        os.makedirs(os.path.dirname(out_mp4_path), exist_ok=True)
+        shutil.move(temp_mp4, out_mp4_path)
+
+    return os.path.getsize(out_mp4_path)
+
+
+def _emit_job_update(job, force=False):
+    now = time.time()
+    last_emit = job.get("_last_emit", 0.0)
+    if not force and (now - last_emit) < 0.35:
+        return
+    job["_last_emit"] = now
+    public_job = {k: v for k, v in job.items() if not k.startswith("_")}
+    try:
+        socketio.emit("download_job_updated", public_job)
+    except Exception:
+        pass
+
+
+def _process_download_job(job_id):
+    with download_lock:
+        job = download_jobs.get(job_id)
+        if not job or job["status"] == "cancelled":
+            return
+        job["status"] = "downloading"
+        job["progress"] = 1.0
+
+    _emit_job_update(job, force=True)
+
+    anime_name = job["anime_name"]
+    display_name = job["display_name"]
+    ep_num = str(job["episode_num"])
+    mode = job["mode"]
+    target = job["target"]  # "cache" or "local"
+
+    def is_cancelled():
+        return job.get("status") == "cancelled"
+
+    try:
+        # Resolve canonical anime name if possible
+        rec = resolve_anime_servers(anime_name)
+        canonical_name = rec["name"] if rec else anime_name
+        job["anime_name"] = canonical_name
+
+        # If target is "local" and episode is already cached on website, serve cached file immediately!
+        existing_cache = get_cached_episode_record(canonical_name, ep_num, mode)
+        if existing_cache and os.path.exists(existing_cache["video_path"]):
+            if target == "local":
+                job[" _file_path"] = existing_cache["video_path"]
+                job["_file_path"] = existing_cache["video_path"]
+                job["downloaded_bytes"] = existing_cache["file_size"] or os.path.getsize(existing_cache["video_path"])
+                job["progress"] = 100.0
+                job["status"] = "completed"
+                job["download_url"] = f"/api/downloads/file/{job_id}"
+                _emit_job_update(job, force=True)
+                return
+            elif target == "cache":
+                job["downloaded_bytes"] = existing_cache["file_size"] or os.path.getsize(existing_cache["video_path"])
+                job["progress"] = 100.0
+                job["status"] = "completed"
+                _emit_job_update(job, force=True)
+                socketio.emit("library_updated", {"anime_name": canonical_name})
+                return
+
+        stream_data = get_stream_for_episode(canonical_name, ep_num, mode)
+        if not stream_data or not stream_data.get("url"):
+            raise RuntimeError(f"Could not find {mode.upper()} stream for Episode {ep_num}")
+
+        if is_cancelled():
+            return
+
+        def on_progress(done_segs, total_segs, dl_bytes):
+            job["completed_segments"] = done_segs
+            job["total_segments"] = total_segs
+            job["downloaded_bytes"] = dl_bytes
+            if total_segs > 0:
+                job["progress"] = round(min(94.0, (done_segs / total_segs) * 94.0), 1)
+            _emit_job_update(job, force=False)
+
+        if target == "cache":
+            slug = _safe_anime_slug(canonical_name)
+            anime_dir = os.path.join(LIBRARY_CACHE_DIR, slug)
+            os.makedirs(anime_dir, exist_ok=True)
+
+            out_mp4 = os.path.join(anime_dir, f"ep_{_safe_filename(ep_num)}_{mode}.mp4")
+            out_vtt = os.path.join(anime_dir, f"ep_{_safe_filename(ep_num)}_{mode}.vtt")
+
+            # Ensure anime metadata & poster are saved
+            image_url = _find_anime_image_url(canonical_name, job.get("image", ""))
+            poster_path = _cache_poster_file(canonical_name, image_url, anime_dir)
+            mal_id = stream_data.get("mal_id") or (rec.get("mal_id") if rec else None)
+
+            # Also fetch episode list so offline episode listing works
+            ep_lists = get_episodes(canonical_name)
+            sub_eps_json = json.dumps(ep_lists.get("sub") or [])
+            dub_eps_json = json.dumps(ep_lists.get("dub") or [])
+
+            now = time.time()
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute(
+                    "SELECT poster_path, image_url FROM cached_anime WHERE anime_name = ?",
+                    (canonical_name,),
+                )
+                existing_row = c.fetchone()
+                final_poster = poster_path or (existing_row[0] if existing_row else None)
+                final_image = image_url or (existing_row[1] if existing_row else "")
+                c.execute(
+                    """INSERT INTO cached_anime
+                       (anime_name, display_name, image_url, poster_path, mal_id, sub_episodes_json, dub_episodes_json, added_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(anime_name) DO UPDATE SET
+                           display_name = excluded.display_name,
+                           image_url = CASE WHEN excluded.image_url != '' THEN excluded.image_url ELSE cached_anime.image_url END,
+                           poster_path = COALESCE(excluded.poster_path, cached_anime.poster_path),
+                           mal_id = COALESCE(excluded.mal_id, cached_anime.mal_id),
+                           sub_episodes_json = excluded.sub_episodes_json,
+                           dub_episodes_json = excluded.dub_episodes_json,
+                           updated_at = excluded.updated_at""",
+                    (
+                        canonical_name,
+                        display_name or canonical_name,
+                        final_image,
+                        final_poster,
+                        mal_id,
+                        sub_eps_json,
+                        dub_eps_json,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+                conn.close()
+
+            final_size = download_hls_episode_to_mp4(
+                stream_data, out_mp4, out_vtt, progress_cb=on_progress, cancel_cb=is_cancelled
+            )
+
+            skip_data = stream_data.get("skip")
+            if not skip_data and mal_id:
+                skip_data = _fetch_aniskip_for_cache(mal_id, ep_num)
+
+            vtt_saved = out_vtt if os.path.exists(out_vtt) else None
+
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute(
+                    """INSERT INTO cached_episodes
+                       (anime_name, episode_num, mode, video_path, subtitle_path, file_size, skip_json, mal_id, cached_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(anime_name, episode_num, mode) DO UPDATE SET
+                           video_path = excluded.video_path,
+                           subtitle_path = excluded.subtitle_path,
+                           file_size = excluded.file_size,
+                           skip_json = excluded.skip_json,
+                           mal_id = excluded.mal_id,
+                           cached_at = excluded.cached_at""",
+                    (
+                        canonical_name,
+                        ep_num,
+                        mode,
+                        out_mp4,
+                        vtt_saved,
+                        final_size,
+                        json.dumps(skip_data) if skip_data else None,
+                        mal_id,
+                        time.time(),
+                    ),
+                )
+                conn.commit()
+                conn.close()
+
+            job["_file_path"] = out_mp4
+            job["downloaded_bytes"] = final_size
+            job["progress"] = 100.0
+            job["status"] = "completed"
+            _emit_job_update(job, force=True)
+            socketio.emit("library_updated", {"anime_name": canonical_name})
+
+        else:
+            # target == "local": Download for user's own local media player
+            export_mp4 = os.path.join(EXPORT_CACHE_DIR, f"{job_id}.mp4")
+            export_vtt = os.path.join(EXPORT_CACHE_DIR, f"{job_id}.vtt")
+            final_size = download_hls_episode_to_mp4(
+                stream_data, export_mp4, export_vtt, progress_cb=on_progress, cancel_cb=is_cancelled
+            )
+            if os.path.exists(export_vtt):
+                try:
+                    os.remove(export_vtt)
+                except Exception:
+                    pass
+            job["_file_path"] = export_mp4
+            job["downloaded_bytes"] = final_size
+            job["progress"] = 100.0
+            job["status"] = "completed"
+            job["download_url"] = f"/api/downloads/file/{job_id}"
+            _emit_job_update(job, force=True)
+
+    except InterruptedError:
+        job["status"] = "cancelled"
+        _emit_job_update(job, force=True)
+    except Exception as e:
+        print(f"Download job {job_id} failed: {e}")
+        job["status"] = "failed"
+        job["error"] = str(e)
+        _emit_job_update(job, force=True)
+
+
+def download_worker_loop():
+    while True:
+        try:
+            job_id = download_queue.get()
+            if job_id is None:
+                continue
+            _process_download_job(job_id)
+        except Exception as e:
+            print(f"Error in download worker loop: {e}")
+
+
+# ==========================================
 # Routes
 # ==========================================
 
@@ -1653,6 +2529,15 @@ def logic():
     return send_file("Public/Static/logic.js", mimetype="text/javascript")
 
 
+@app.route("/vendor/<path:filename>")
+def serve_vendor(filename):
+    safe_name = os.path.basename(filename)
+    vendor_path = os.path.join(BASE_DIR, "Public", "Static", "vendor", safe_name)
+    if not os.path.exists(vendor_path):
+        return "Not found", 404
+    return send_file(vendor_path, mimetype="application/javascript")
+
+
 @app.route("/api/search/<path:anime>")
 def search(anime):
     mode = request.args.get("mode", "sub")
@@ -1669,12 +2554,39 @@ def show(show_id):
 @app.route("/api/stream/<path:show_id>/<episode_string>")
 def get_stream(show_id, episode_string):
     mode = request.args.get("mode", "sub")
+
+    # 1. Check if episode is cached locally in the Website Library (works 100% offline!)
+    cached_rec = get_cached_episode_record(show_id, episode_string, mode)
+    if cached_rec:
+        skip_obj = None
+        if cached_rec.get("skip_json"):
+            try:
+                skip_obj = json.loads(cached_rec["skip_json"])
+            except Exception:
+                skip_obj = None
+        return jsonify(
+            {
+                "status": "success",
+                "cached": True,
+                "stream_url": f"/api/library/video/{cached_rec['id']}",
+                "referrer": None,
+                "sub_url": f"/api/library/subtitle/{cached_rec['id']}"
+                if cached_rec.get("subtitle_path")
+                else None,
+                "subtitles": [],
+                "mal_id": cached_rec.get("mal_id"),
+                "skip": skip_obj,
+            }
+        )
+
+    # 2. Otherwise fetch live stream
     stream_data = get_stream_for_episode(show_id, episode_string, mode)
 
     if stream_data and stream_data.get("url"):
         return jsonify(
             {
                 "status": "success",
+                "cached": False,
                 "stream_url": stream_data["url"],
                 "referrer": stream_data.get("referrer"),
                 "sub_url": stream_data.get("sub_url"),
@@ -1685,6 +2597,311 @@ def get_stream(show_id, episode_string):
         )
     else:
         return jsonify({"error": "Failed to extract streaming link."}), 500
+
+
+@app.route("/api/library")
+def api_get_library():
+    return jsonify(get_library_data())
+
+
+@app.route("/api/library/storage")
+def api_get_storage():
+    return jsonify(get_storage_status())
+
+
+@app.route("/api/library/poster/<path:anime_id>")
+def api_get_library_poster(anime_id):
+    rec = lookup_anime_in_db(anime_id)
+    canonical = rec["name"] if rec else str(anime_id).strip()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT poster_path, image_url FROM cached_anime WHERE anime_name IN (?, ?) LIMIT 1",
+            (canonical, str(anime_id).strip()),
+        )
+        row = c.fetchone()
+        conn.close()
+    if row and row[0] and os.path.exists(row[0]):
+        return send_file(row[0])
+    if row and row[1]:
+        return image_proxy_internal(row[1])
+    return "Poster not found", 404
+
+
+def image_proxy_internal(raw_url):
+    h = hashlib.sha256(raw_url.strip().encode("utf-8")).hexdigest()
+    for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"]:
+        cand = os.path.join(IMAGE_CACHE_DIR, f"{h}{ext}")
+        if os.path.exists(cand):
+            return send_file(cand)
+    return ("Not cached", 404)
+
+
+@app.route("/api/library/video/<int:cache_id>")
+def api_stream_cached_video(cache_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT anime_name, episode_num, mode, video_path FROM cached_episodes WHERE id = ?",
+            (cache_id,),
+        )
+        row = c.fetchone()
+        conn.close()
+    if not row or not row[3] or not os.path.exists(row[3]):
+        return "Cached video not found", 404
+    return send_file(row[3], mimetype="video/mp4", conditional=True)
+
+
+@app.route("/api/library/subtitle/<int:cache_id>")
+def api_stream_cached_subtitle(cache_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT subtitle_path FROM cached_episodes WHERE id = ?", (cache_id,))
+        row = c.fetchone()
+        conn.close()
+    if not row or not row[0] or not os.path.exists(row[0]):
+        return "Cached subtitle not found", 404
+    return send_file(row[0], mimetype="text/vtt")
+
+
+@app.route("/api/library/anime/<path:anime_id>", methods=["DELETE"])
+def api_delete_cached_anime(anime_id):
+    rec = lookup_anime_in_db(anime_id)
+    canonical = rec["name"] if rec else str(anime_id).strip()
+    candidates = (canonical, str(anime_id).strip())
+
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT video_path, subtitle_path FROM cached_episodes WHERE anime_name IN (?, ?)",
+            candidates,
+        )
+        ep_files = c.fetchall()
+        c.execute(
+            "SELECT poster_path FROM cached_anime WHERE anime_name IN (?, ?)",
+            candidates,
+        )
+        poster_rows = c.fetchall()
+        c.execute("DELETE FROM cached_episodes WHERE anime_name IN (?, ?)", candidates)
+        c.execute("DELETE FROM cached_anime WHERE anime_name IN (?, ?)", candidates)
+        conn.commit()
+        conn.close()
+
+    dirs_to_check = set()
+    for vpath, spath in ep_files:
+        for p in (vpath, spath):
+            if p and os.path.exists(p):
+                dirs_to_check.add(os.path.dirname(p))
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+    for (ppath,) in poster_rows:
+        if ppath and os.path.exists(ppath):
+            dirs_to_check.add(os.path.dirname(ppath))
+            try:
+                os.remove(ppath)
+            except Exception:
+                pass
+    for d in dirs_to_check:
+        try:
+            if os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
+        except Exception:
+            pass
+
+    socketio.emit("library_updated", {"anime_name": canonical})
+    return jsonify({"status": "success", "storage": get_storage_status()})
+
+
+@app.route("/api/library/episode/<path:anime_id>/<episode_num>", methods=["DELETE"])
+def api_delete_cached_episode(anime_id, episode_num):
+    mode = request.args.get("mode")
+    rec = lookup_anime_in_db(anime_id)
+    canonical = rec["name"] if rec else str(anime_id).strip()
+    candidates = (canonical, str(anime_id).strip())
+
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if mode:
+            c.execute(
+                "SELECT video_path, subtitle_path FROM cached_episodes WHERE anime_name IN (?, ?) AND episode_num = ? AND mode = ?",
+                (candidates[0], candidates[1], str(episode_num), mode),
+            )
+            rows = c.fetchall()
+            c.execute(
+                "DELETE FROM cached_episodes WHERE anime_name IN (?, ?) AND episode_num = ? AND mode = ?",
+                (candidates[0], candidates[1], str(episode_num), mode),
+            )
+        else:
+            c.execute(
+                "SELECT video_path, subtitle_path FROM cached_episodes WHERE anime_name IN (?, ?) AND episode_num = ?",
+                (candidates[0], candidates[1], str(episode_num)),
+            )
+            rows = c.fetchall()
+            c.execute(
+                "DELETE FROM cached_episodes WHERE anime_name IN (?, ?) AND episode_num = ?",
+                (candidates[0], candidates[1], str(episode_num)),
+            )
+
+        c.execute(
+            "SELECT COUNT(*) FROM cached_episodes WHERE anime_name IN (?, ?)",
+            candidates,
+        )
+        remaining = c.fetchone()[0]
+        if remaining == 0:
+            c.execute("DELETE FROM cached_anime WHERE anime_name IN (?, ?)", candidates)
+        conn.commit()
+        conn.close()
+
+    for vpath, spath in rows:
+        for p in (vpath, spath):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    socketio.emit("library_updated", {"anime_name": canonical})
+    return jsonify({"status": "success", "storage": get_storage_status()})
+
+
+@app.route("/api/downloads/start", methods=["POST"])
+def api_start_downloads():
+    data = request.get_json(silent=True) or {}
+    anime_id = str(data.get("anime_id") or data.get("anime_name") or "").strip()
+    display_name = str(data.get("anime_name") or anime_id).strip()
+    image = str(data.get("image") or "").strip()
+    mode = str(data.get("mode") or "sub").lower()
+    if mode not in ("sub", "dub"):
+        mode = "sub"
+    target = str(data.get("target") or "cache").lower()
+    if target not in ("cache", "local"):
+        target = "cache"
+
+    if not anime_id:
+        return jsonify({"error": "Missing anime_id"}), 400
+
+    rec = lookup_anime_in_db(anime_id)
+    canonical = rec["name"] if rec else anime_id
+
+    episodes_req = data.get("episodes")
+    if episodes_req == "all" or data.get("download_all"):
+        ep_info = get_episodes(canonical)
+        ep_list = [str(x) for x in (ep_info.get(mode) or [])]
+    elif isinstance(episodes_req, list):
+        ep_list = [str(x) for x in episodes_req if str(x).strip()]
+    elif episodes_req:
+        ep_list = [str(episodes_req)]
+    else:
+        return jsonify({"error": "No episodes specified"}), 400
+
+    if not ep_list:
+        return jsonify({"error": f"No {mode.upper()} episodes found for {display_name}"}), 404
+
+    created_jobs = []
+    with download_lock:
+        for ep_num in ep_list:
+            # Check if an identical active job is already queued or downloading
+            already_active = None
+            for existing in download_jobs.values():
+                if (
+                    existing["anime_name"] in (canonical, anime_id)
+                    and existing["episode_num"] == str(ep_num)
+                    and existing["mode"] == mode
+                    and existing["target"] == target
+                    and existing["status"] in ("queued", "downloading", "remuxing")
+                ):
+                    already_active = existing
+                    break
+            if already_active:
+                created_jobs.append({k: v for k, v in already_active.items() if not k.startswith("_")})
+                continue
+
+            job_id = uuid.uuid4().hex[:12]
+            job = {
+                "job_id": job_id,
+                "anime_name": canonical,
+                "display_name": display_name,
+                "episode_num": str(ep_num),
+                "mode": mode,
+                "target": target,
+                "image": image,
+                "status": "queued",
+                "progress": 0.0,
+                "downloaded_bytes": 0,
+                "total_segments": 0,
+                "completed_segments": 0,
+                "error": None,
+                "download_url": None,
+                "created_at": time.time(),
+            }
+            download_jobs[job_id] = job
+            download_queue.put(job_id)
+            created_jobs.append({k: v for k, v in job.items() if not k.startswith("_")})
+
+    return jsonify({"status": "success", "jobs": created_jobs})
+
+
+@app.route("/api/downloads/status")
+def api_downloads_status():
+    with download_lock:
+        jobs_list = [
+            {k: v for k, v in j.items() if not k.startswith("_")}
+            for j in sorted(download_jobs.values(), key=lambda x: x["created_at"], reverse=True)
+        ]
+    return jsonify({"jobs": jobs_list})
+
+
+@app.route("/api/downloads/cancel/<job_id>", methods=["POST"])
+def api_cancel_download(job_id):
+    with download_lock:
+        job = download_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] in ("queued", "downloading", "remuxing"):
+            job["status"] = "cancelled"
+    _emit_job_update(job, force=True)
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/downloads/clear", methods=["POST"])
+def api_clear_downloads():
+    with download_lock:
+        to_remove = [
+            jid
+            for jid, j in download_jobs.items()
+            if j["status"] in ("completed", "failed", "cancelled")
+        ]
+        for jid in to_remove:
+            job = download_jobs.pop(jid, None)
+            if job and job.get("target") == "local":
+                fpath = job.get("_file_path")
+                if fpath and fpath.startswith(EXPORT_CACHE_DIR) and os.path.exists(fpath):
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/downloads/file/<job_id>")
+def api_download_job_file(job_id):
+    with download_lock:
+        job = download_jobs.get(job_id)
+    if not job or job.get("status") != "completed":
+        return "Download file not ready", 404
+    fpath = job.get("_file_path")
+    if not fpath or not os.path.exists(fpath):
+        return "File not found on disk", 404
+
+    fname = f"{_safe_filename(job['display_name'])} - Episode {_safe_filename(job['episode_num'])} ({job['mode'].upper()}).mp4"
+    return send_file(fpath, mimetype="video/mp4", as_attachment=True, download_name=fname)
 
 
 @app.route("/api/mappings")
@@ -2060,6 +3277,7 @@ init_db()
 init_image_cache_on_startup()
 socketio.start_background_task(update_current_season_loop)
 socketio.start_background_task(image_cleanup_loop)
+socketio.start_background_task(download_worker_loop)
 
 if __name__ == "__main__":
     socketio.run(
