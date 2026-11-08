@@ -3275,9 +3275,9 @@ def handle_seek_sync(data):
 # Initialize database and background threads for both Flask and Gunicorn
 init_db()
 init_image_cache_on_startup()
-socketio.start_background_task(update_current_season_loop)
-socketio.start_background_task(image_cleanup_loop)
-socketio.start_background_task(download_worker_loop)
+threading.Thread(target=update_current_season_loop, daemon=True).start()
+threading.Thread(target=image_cleanup_loop, daemon=True).start()
+threading.Thread(target=download_worker_loop, daemon=True).start()
 
 if __name__ == "__main__":
     socketio.run(
