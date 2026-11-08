@@ -244,19 +244,26 @@ def sni_split_https_get(url, headers=None, timeout=10):
 
 def hianime_curl(url, referer=None, timeout=10):
     """
-    Port of ani-cli's hianime_curl.
+    Port of ani-cli's hianime_curl with transient retry support.
     """
     headers = {"User-Agent": AGENT}
     if referer:
         headers["Referer"] = referer
 
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        if resp.status_code // 100 != 2 and "just a moment" not in resp.text.lower():
-            raise RuntimeError(f"Request failed: HTTP {resp.status_code} from {url}")
-        return resp.text
-    except requests.exceptions.SSLError:
-        return sni_split_https_get(url, headers=headers, timeout=timeout)
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code // 100 != 2 and "just a moment" not in resp.text.lower():
+                raise RuntimeError(f"Request failed: HTTP {resp.status_code} from {url}")
+            return resp.text
+        except requests.exceptions.SSLError:
+            return sni_split_https_get(url, headers=headers, timeout=timeout)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+    raise last_err
 
 
 def b64_decode(s):
@@ -1417,6 +1424,12 @@ def _is_host_in_allowlist(host, allowlist):
     return False
 
 
+# Cache validated (host, port) -> expiry timestamp to avoid hammering the router's DNS resolver
+# across hundreds of HLS video segments.
+_dns_validation_cache = {}
+_DNS_CACHE_TTL = 900  # 15 minutes
+
+
 def validate_public_http_url(url, allowed_hosts=None):
     """
     Validates that `url` is a standard public HTTP/HTTPS URL on port 80/443,
@@ -1459,15 +1472,27 @@ def validate_public_http_url(url, allowed_hosts=None):
         return False, "Host is not in the allowed proxy list"
 
     effective_port = port or (443 if parsed.scheme == "https" else 80)
-    try:
-        addr_info = socket.getaddrinfo(
-            host, effective_port, proto=socket.IPPROTO_TCP
-        )
-    except Exception:
-        return False, "DNS resolution failed"
+    cache_key = (host, effective_port)
+    now = time.time()
+    with proxy_security_lock:
+        cached_exp = _dns_validation_cache.get(cache_key)
+        if cached_exp and now < cached_exp:
+            return True, None
+
+    addr_info = None
+    for attempt in range(3):
+        try:
+            addr_info = socket.getaddrinfo(
+                host, effective_port, proto=socket.IPPROTO_TCP
+            )
+            if addr_info:
+                break
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.35 * (attempt + 1))
 
     if not addr_info:
-        return False, "No DNS records found"
+        return False, "DNS resolution failed"
 
     for entry in addr_info:
         ip_str = entry[4][0]
@@ -1486,22 +1511,28 @@ def validate_public_http_url(url, allowed_hosts=None):
         ):
             return False, "Private or non-global IP addresses are forbidden"
 
+    with proxy_security_lock:
+        _dns_validation_cache[cache_key] = time.time() + _DNS_CACHE_TTL
+
     return True, None
 
 
-def safe_upstream_get(url, headers=None, timeout=15, allowed_hosts=None, max_redirects=3):
+def safe_upstream_get(
+    url, headers=None, timeout=15, allowed_hosts=None, max_redirects=3, session=None
+):
     """
     Performs an HTTP GET with SSRF & host-allowlist validation on the initial
     URL and every redirect hop (`allow_redirects=False`).
     Returns `(response, final_url)` or raises `PermissionError` / `RuntimeError`.
     """
     current_url = url.strip()
+    getter = session.get if session is not None else requests.get
     for _ in range(max_redirects + 1):
         ok, reason = validate_public_http_url(current_url, allowed_hosts=allowed_hosts)
         if not ok:
             raise PermissionError(reason)
 
-        req = requests.get(
+        req = getter(
             current_url,
             headers=headers,
             stream=True,
@@ -2106,19 +2137,20 @@ def _fetch_aniskip_for_cache(mal_id, ep_num):
     return None
 
 
-def _fetch_upstream_bytes(url, referer, timeout=20):
+def _fetch_upstream_bytes(url, referer, timeout=25, session=None):
     headers = {
         "User-Agent": AGENT,
         "Referer": referer or "https://zokoanime.video/",
     }
     allow_stream_url(url)
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             req, _ = safe_upstream_get(
                 url,
                 headers=headers,
                 timeout=timeout,
                 allowed_hosts=ALLOWED_STREAM_HOSTS,
+                session=session,
             )
             try:
                 if req.status_code // 100 == 2:
@@ -2126,97 +2158,111 @@ def _fetch_upstream_bytes(url, referer, timeout=20):
             finally:
                 req.close()
         except Exception as e:
-            if attempt == 2:
+            if attempt == 4:
                 raise e
-            time.sleep(0.4 * (attempt + 1))
+            time.sleep(0.5 * (attempt + 1))
     raise RuntimeError(f"Failed to download segment: {url}")
 
 
-def _parse_and_download_hls_playlist(playlist_url, referer, out_ts_path, progress_cb=None, cancel_cb=None):
-    raw_bytes = _fetch_upstream_bytes(playlist_url, referer, timeout=15)
-    playlist_text = raw_bytes.decode("utf-8", errors="replace")
+def _parse_and_download_hls_playlist(
+    playlist_url, referer, out_ts_path, progress_cb=None, cancel_cb=None, session=None
+):
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        own_session = True
 
-    lines = [ln.strip() for ln in playlist_text.splitlines() if ln.strip()]
+    try:
+        raw_bytes = _fetch_upstream_bytes(playlist_url, referer, timeout=15, session=session)
+        playlist_text = raw_bytes.decode("utf-8", errors="replace")
 
-    # Check if this is still a master playlist
-    if any(ln.startswith("#EXT-X-STREAM-INF") for ln in lines):
-        variants = []
-        for i, ln in enumerate(lines):
-            if ln.startswith("#EXT-X-STREAM-INF") and "EXT-X-I-FRAME" not in ln:
-                m_res = re.search(r"RESOLUTION=\d+x(\d+)", ln)
-                res_h = int(m_res.group(1)) if m_res else 0
-                if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
-                    v_url = urllib.parse.urljoin(playlist_url, lines[i + 1])
-                    variants.append((res_h, v_url))
-        if variants:
-            variants.sort(key=lambda x: x[0], reverse=True)
-            return _parse_and_download_hls_playlist(
-                variants[0][1], referer, out_ts_path, progress_cb, cancel_cb
-            )
+        lines = [ln.strip() for ln in playlist_text.splitlines() if ln.strip()]
 
-    init_map_url = None
-    segment_urls = []
-    for ln in lines:
-        if ln.startswith("#EXT-X-MAP:") and 'URI="' in ln:
-            m = re.search(r'URI="([^"]+)"', ln)
-            if m:
-                init_map_url = urllib.parse.urljoin(playlist_url, m.group(1))
-        elif not ln.startswith("#"):
-            segment_urls.append(urllib.parse.urljoin(playlist_url, ln))
+        # Check if this is still a master playlist
+        if any(ln.startswith("#EXT-X-STREAM-INF") for ln in lines):
+            variants = []
+            for i, ln in enumerate(lines):
+                if ln.startswith("#EXT-X-STREAM-INF") and "EXT-X-I-FRAME" not in ln:
+                    m_res = re.search(r"RESOLUTION=\d+x(\d+)", ln)
+                    res_h = int(m_res.group(1)) if m_res else 0
+                    if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                        v_url = urllib.parse.urljoin(playlist_url, lines[i + 1])
+                        variants.append((res_h, v_url))
+            if variants:
+                variants.sort(key=lambda x: x[0], reverse=True)
+                return _parse_and_download_hls_playlist(
+                    variants[0][1], referer, out_ts_path, progress_cb, cancel_cb, session=session
+                )
 
-    if not segment_urls:
-        raise RuntimeError("No video segments found in HLS playlist")
+        init_map_url = None
+        segment_urls = []
+        for ln in lines:
+            if ln.startswith("#EXT-X-MAP:") and 'URI="' in ln:
+                m = re.search(r'URI="([^"]+)"', ln)
+                if m:
+                    init_map_url = urllib.parse.urljoin(playlist_url, m.group(1))
+            elif not ln.startswith("#"):
+                segment_urls.append(urllib.parse.urljoin(playlist_url, ln))
 
-    total_segments = len(segment_urls)
-    completed_segments = 0
-    downloaded_bytes = 0
-    seg_Lock = threading.Lock()
+        if not segment_urls:
+            raise RuntimeError("No video segments found in HLS playlist")
 
-    if progress_cb:
-        progress_cb(0, total_segments, 0)
+        total_segments = len(segment_urls)
+        completed_segments = 0
+        downloaded_bytes = 0
+        seg_Lock = threading.Lock()
 
-    init_bytes = b""
-    if init_map_url:
-        init_bytes = _fetch_upstream_bytes(init_map_url, referer, timeout=20)
-        downloaded_bytes += len(init_bytes)
+        if progress_cb:
+            progress_cb(0, total_segments, 0)
 
-    # Download segments in batches to keep memory bounded while maximizing speed
-    BATCH_SIZE = 24
-    with open(out_ts_path, "wb") as out_f:
-        if init_bytes:
-            out_f.write(init_bytes)
+        init_bytes = b""
+        if init_map_url:
+            init_bytes = _fetch_upstream_bytes(init_map_url, referer, timeout=20, session=session)
+            downloaded_bytes += len(init_bytes)
 
-        for batch_start in range(0, total_segments, BATCH_SIZE):
-            if cancel_cb and cancel_cb():
-                raise InterruptedError("Download cancelled")
+        # Download segments in batches using persistent HTTP connections to avoid DNS/socket exhaustion
+        BATCH_SIZE = 20
+        with open(out_ts_path, "wb") as out_f:
+            if init_bytes:
+                out_f.write(init_bytes)
 
-            batch = segment_urls[batch_start : batch_start + BATCH_SIZE]
-            batch_results = [None] * len(batch)
-
-            def _dl_one(idx, s_url):
+            for batch_start in range(0, total_segments, BATCH_SIZE):
                 if cancel_cb and cancel_cb():
                     raise InterruptedError("Download cancelled")
-                data = _fetch_upstream_bytes(s_url, referer, timeout=25)
-                return idx, data
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = [pool.submit(_dl_one, i, u) for i, u in enumerate(batch)]
-                for fut in as_completed(futures):
+                batch = segment_urls[batch_start : batch_start + BATCH_SIZE]
+                batch_results = [None] * len(batch)
+
+                def _dl_one(idx, s_url):
                     if cancel_cb and cancel_cb():
                         raise InterruptedError("Download cancelled")
-                    idx, data = fut.result()
-                    batch_results[idx] = data
-                    with seg_Lock:
-                        completed_segments += 1
-                        downloaded_bytes += len(data)
-                        if progress_cb:
-                            progress_cb(completed_segments, total_segments, downloaded_bytes)
+                    data = _fetch_upstream_bytes(s_url, referer, timeout=25, session=session)
+                    return idx, data
 
-            for chunk_bytes in batch_results:
-                if chunk_bytes:
-                    out_f.write(chunk_bytes)
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(_dl_one, i, u) for i, u in enumerate(batch)]
+                    for fut in as_completed(futures):
+                        if cancel_cb and cancel_cb():
+                            raise InterruptedError("Download cancelled")
+                        idx, data = fut.result()
+                        batch_results[idx] = data
+                        with seg_Lock:
+                            completed_segments += 1
+                            downloaded_bytes += len(data)
+                            if progress_cb:
+                                progress_cb(completed_segments, total_segments, downloaded_bytes)
 
-    return total_segments, downloaded_bytes
+                for chunk_bytes in batch_results:
+                    if chunk_bytes:
+                        out_f.write(chunk_bytes)
+
+        return total_segments, downloaded_bytes
+    finally:
+        if own_session:
+            session.close()
 
 
 def download_hls_episode_to_mp4(stream_data, out_mp4_path, out_vtt_path=None, progress_cb=None, cancel_cb=None):
@@ -2505,6 +2551,7 @@ def download_worker_loop():
             if job_id is None:
                 continue
             _process_download_job(job_id)
+            time.sleep(0.5)
         except Exception as e:
             print(f"Error in download worker loop: {e}")
 
@@ -2870,23 +2917,66 @@ def api_cancel_download(job_id):
     return jsonify({"status": "success"})
 
 
+@app.route("/api/downloads/<job_id>", methods=["DELETE"])
+def api_delete_download_job(job_id):
+    with download_lock:
+        job = download_jobs.get(job_id)
+        if not job:
+            return jsonify({"status": "success"})
+        job["status"] = "cancelled"
+        download_jobs.pop(job_id, None)
+        if job.get("target") == "local":
+            fpath = job.get("_file_path")
+            if fpath and fpath.startswith(EXPORT_CACHE_DIR) and os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/downloads/retry/<job_id>", methods=["POST"])
+def api_retry_download_job(job_id):
+    with download_lock:
+        job = download_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] in ("failed", "cancelled"):
+            job["status"] = "queued"
+            job["progress"] = 0.0
+            job["downloaded_bytes"] = 0
+            job["completed_segments"] = 0
+            job["total_segments"] = 0
+            job["error"] = None
+            download_queue.put(job_id)
+    _emit_job_update(job, force=True)
+    return jsonify({"status": "success", "job": {k: v for k, v in job.items() if not k.startswith("_")}})
+
+
 @app.route("/api/downloads/clear", methods=["POST"])
 def api_clear_downloads():
+    body = request.get_json(silent=True) or {}
+    clear_all = bool(body.get("all"))
     with download_lock:
-        to_remove = [
-            jid
-            for jid, j in download_jobs.items()
-            if j["status"] in ("completed", "failed", "cancelled")
-        ]
+        if clear_all:
+            to_remove = list(download_jobs.keys())
+        else:
+            to_remove = [
+                jid
+                for jid, j in download_jobs.items()
+                if j["status"] in ("completed", "failed", "cancelled")
+            ]
         for jid in to_remove:
             job = download_jobs.pop(jid, None)
-            if job and job.get("target") == "local":
-                fpath = job.get("_file_path")
-                if fpath and fpath.startswith(EXPORT_CACHE_DIR) and os.path.exists(fpath):
-                    try:
-                        os.remove(fpath)
-                    except Exception:
-                        pass
+            if job:
+                job["status"] = "cancelled"
+                if job.get("target") == "local":
+                    fpath = job.get("_file_path")
+                    if fpath and fpath.startswith(EXPORT_CACHE_DIR) and os.path.exists(fpath):
+                        try:
+                            os.remove(fpath)
+                        except Exception:
+                            pass
     return jsonify({"status": "success"})
 
 

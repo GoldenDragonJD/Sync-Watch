@@ -2331,10 +2331,14 @@ const downloadsDrawer = document.getElementById("downloads-drawer");
 const downloadsListEl = document.getElementById("downloads-list");
 const closeDrawerBtn = document.getElementById("close-drawer-btn");
 const clearCompletedDlBtn = document.getElementById("clear-completed-dl-btn");
+const clearAllDlBtn = document.getElementById("clear-all-dl-btn");
 
 if (navDownloadsBtn && downloadsDrawer) {
   navDownloadsBtn.addEventListener("click", () => {
     downloadsDrawer.classList.toggle("hidden");
+    if (!downloadsDrawer.classList.contains("hidden")) {
+      pollDownloadJobsStatus();
+    }
   });
 }
 if (closeDrawerBtn && downloadsDrawer) {
@@ -2344,7 +2348,11 @@ if (closeDrawerBtn && downloadsDrawer) {
 }
 if (clearCompletedDlBtn) {
   clearCompletedDlBtn.addEventListener("click", async () => {
-    await fetch("/api/downloads/clear", { method: "POST" });
+    await fetch("/api/downloads/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ all: false }),
+    });
     Object.keys(activeDownloadJobs).forEach((jid) => {
       if (
         ["completed", "failed", "cancelled"].includes(
@@ -2354,6 +2362,17 @@ if (clearCompletedDlBtn) {
         delete activeDownloadJobs[jid];
       }
     });
+    renderDownloadJobsList();
+  });
+}
+if (clearAllDlBtn) {
+  clearAllDlBtn.addEventListener("click", async () => {
+    await fetch("/api/downloads/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ all: true }),
+    });
+    activeDownloadJobs = {};
     renderDownloadJobsList();
   });
 }
@@ -2397,6 +2416,46 @@ async function fetchDownloadJobs() {
     renderDownloadJobsList();
   } catch (err) {}
 }
+
+async function pollDownloadJobsStatus() {
+  try {
+    const res = await fetch("/api/downloads/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    let newlyCompletedCache = false;
+    const nextJobs = {};
+    (data.jobs || []).forEach((j) => {
+      const prev = activeDownloadJobs[j.job_id];
+      if (
+        prev &&
+        prev.status !== "completed" &&
+        j.status === "completed" &&
+        j.target === "cache"
+      ) {
+        newlyCompletedCache = true;
+      }
+      nextJobs[j.job_id] = j;
+      maybeTriggerBrowserDownload(j);
+    });
+    activeDownloadJobs = nextJobs;
+    renderDownloadJobsList();
+    if (newlyCompletedCache) {
+      fetchLibraryData();
+    }
+  } catch (err) {}
+}
+
+// Poll every 1.5s whenever there are active jobs or the drawer is open
+setInterval(() => {
+  const hasRunning = Object.values(activeDownloadJobs).some((j) =>
+    ["queued", "downloading", "remuxing"].includes(j.status),
+  );
+  const drawerOpen =
+    downloadsDrawer && !downloadsDrawer.classList.contains("hidden");
+  if (hasRunning || drawerOpen) {
+    pollDownloadJobsStatus();
+  }
+}, 1500);
 
 function maybeTriggerBrowserDownload(job) {
   if (
@@ -2464,6 +2523,7 @@ function renderDownloadJobsList() {
     }
 
     const canCancel = ["queued", "downloading", "remuxing"].includes(job.status);
+    const canRetry = ["failed", "cancelled"].includes(job.status);
     const canSaveLocal =
       job.target === "local" && job.status === "completed" && job.download_url;
 
@@ -2473,17 +2533,23 @@ function renderDownloadJobsList() {
           <div class="dl-job-title">${escapeHtml(job.display_name || job.anime_name)} — Ep ${escapeHtml(job.episode_num)} (${escapeHtml((job.mode || "sub").toUpperCase())})</div>
           <div style="font-size: 0.73rem; color: var(--primary); font-weight: 600;">${targetLabel}</div>
         </div>
-        <div style="display: flex; gap: 4px;">
+        <div style="display: flex; gap: 4px; align-items: center;">
           ${
             canSaveLocal
               ? `<a href="${escapeHtml(job.download_url)}" download class="mini-link-btn" style="text-decoration: none; color: #34d399; border-color: #10b981;">💾 Save MP4</a>`
               : ""
           }
           ${
-            canCancel
-              ? `<button type="button" class="mini-link-btn cancel-job-btn" data-jid="${escapeHtml(job.job_id)}">Cancel</button>`
+            canRetry
+              ? `<button type="button" class="mini-link-btn retry-job-btn" style="color: #60a5fa; border-color: rgba(96, 165, 250, 0.4);" title="Retry download">↻ Retry</button>`
               : ""
           }
+          ${
+            canCancel
+              ? `<button type="button" class="mini-link-btn cancel-job-btn" title="Cancel download">Cancel</button>`
+              : ""
+          }
+          <button type="button" class="mini-link-btn remove-job-btn" style="color: #f87171; border-color: rgba(239, 68, 68, 0.35); padding: 0.2rem 0.45rem;" title="Remove from queue">✕</button>
         </div>
       </div>
       <div class="dl-job-bar-bg">
@@ -2500,6 +2566,28 @@ function renderDownloadJobsList() {
       cancelBtn.addEventListener("click", async () => {
         await fetch(`/api/downloads/cancel/${encodeURIComponent(job.job_id)}`, {
           method: "POST",
+        });
+        await pollDownloadJobsStatus();
+      });
+    }
+
+    const retryBtn = card.querySelector(".retry-job-btn");
+    if (retryBtn) {
+      retryBtn.addEventListener("click", async () => {
+        await fetch(`/api/downloads/retry/${encodeURIComponent(job.job_id)}`, {
+          method: "POST",
+        });
+        await pollDownloadJobsStatus();
+      });
+    }
+
+    const removeBtn = card.querySelector(".remove-job-btn");
+    if (removeBtn) {
+      removeBtn.addEventListener("click", async () => {
+        delete activeDownloadJobs[job.job_id];
+        renderDownloadJobsList();
+        await fetch(`/api/downloads/${encodeURIComponent(job.job_id)}`, {
+          method: "DELETE",
         });
       });
     }
