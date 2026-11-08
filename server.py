@@ -2164,178 +2164,327 @@ def _fetch_upstream_bytes(url, referer, timeout=25, session=None):
     raise RuntimeError(f"Failed to download segment: {url}")
 
 
-def _parse_and_download_hls_playlist(
-    playlist_url, referer, out_ts_path, progress_cb=None, cancel_cb=None, session=None
+def _select_audio_rendition_url(master_lines, master_url, mode="sub"):
+    audio_tracks = []
+    for ln in master_lines:
+        if ln.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in ln and 'URI="' in ln:
+            m_uri = re.search(r'URI="([^"]+)"', ln)
+            if not m_uri:
+                continue
+            uri_full = urllib.parse.urljoin(master_url, m_uri.group(1))
+            m_lang = re.search(r'LANGUAGE="([^"]+)"', ln, re.IGNORECASE)
+            m_name = re.search(r'NAME="([^"]+)"', ln, re.IGNORECASE)
+            m_def = re.search(r"DEFAULT=(YES|NO)", ln, re.IGNORECASE)
+            audio_tracks.append(
+                {
+                    "url": uri_full,
+                    "lang": (m_lang.group(1).lower() if m_lang else ""),
+                    "name": (m_name.group(1).lower() if m_name else ""),
+                    "default": (m_def.group(1).upper() == "YES" if m_def else False),
+                }
+            )
+    if not audio_tracks:
+        return None
+    if str(mode).lower() == "dub":
+        for t in audio_tracks:
+            if t["lang"].startswith("en") or "english" in t["name"] or "dub" in t["name"]:
+                return t["url"]
+    else:
+        for t in audio_tracks:
+            if t["lang"].startswith(("ja", "jp")) or "japan" in t["name"] or "sub" in t["name"]:
+                return t["url"]
+    for t in audio_tracks:
+        if t["default"]:
+            return t["url"]
+    return audio_tracks[0]["url"]
+
+
+def _parse_media_playlist_segments(playlist_url, referer, session):
+    raw_bytes = _fetch_upstream_bytes(playlist_url, referer, timeout=15, session=session)
+    playlist_text = raw_bytes.decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in playlist_text.splitlines() if ln.strip()]
+
+    if any(ln.startswith("#EXT-X-STREAM-INF") for ln in lines):
+        variants = []
+        for i, ln in enumerate(lines):
+            if ln.startswith("#EXT-X-STREAM-INF") and "EXT-X-I-FRAME" not in ln:
+                m_res = re.search(r"RESOLUTION=\d+x(\d+)", ln)
+                res_h = int(m_res.group(1)) if m_res else 0
+                if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                    v_url = urllib.parse.urljoin(playlist_url, lines[i + 1])
+                    variants.append((res_h, v_url))
+        if variants:
+            variants.sort(key=lambda x: x[0], reverse=True)
+            return _parse_media_playlist_segments(variants[0][1], referer, session)
+
+    init_map_url = None
+    segment_urls = []
+    for ln in lines:
+        if ln.startswith("#EXT-X-MAP:") and 'URI="' in ln:
+            m = re.search(r'URI="([^"]+)"', ln)
+            if m:
+                init_map_url = urllib.parse.urljoin(playlist_url, m.group(1))
+        elif not ln.startswith("#"):
+            segment_urls.append(urllib.parse.urljoin(playlist_url, ln))
+
+    return init_map_url, segment_urls
+
+
+def _download_segment_list_to_file(
+    init_map_url, segment_urls, referer, out_ts_path, session, cancel_cb=None, on_chunk_cb=None
 ):
-    own_session = False
-    if session is None:
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        own_session = True
+    init_bytes = b""
+    if init_map_url:
+        init_bytes = _fetch_upstream_bytes(init_map_url, referer, timeout=20, session=session)
+        if on_chunk_cb:
+            on_chunk_cb(0, len(init_bytes))
+
+    BATCH_SIZE = 20
+    total_segs = len(segment_urls)
+    with open(out_ts_path, "wb") as out_f:
+        if init_bytes:
+            out_f.write(init_bytes)
+
+        for batch_start in range(0, total_segs, BATCH_SIZE):
+            if cancel_cb and cancel_cb():
+                raise InterruptedError("Download cancelled")
+
+            batch = segment_urls[batch_start : batch_start + BATCH_SIZE]
+            batch_results = [None] * len(batch)
+
+            def _dl_one(idx, s_url):
+                if cancel_cb and cancel_cb():
+                    raise InterruptedError("Download cancelled")
+                data = _fetch_upstream_bytes(s_url, referer, timeout=25, session=session)
+                return idx, data
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(_dl_one, i, u) for i, u in enumerate(batch)]
+                for fut in as_completed(futures):
+                    if cancel_cb and cancel_cb():
+                        raise InterruptedError("Download cancelled")
+                    idx, data = fut.result()
+                    batch_results[idx] = data
+                    if on_chunk_cb:
+                        on_chunk_cb(1, len(data))
+
+            for chunk_bytes in batch_results:
+                if chunk_bytes:
+                    out_f.write(chunk_bytes)
+
+
+def download_hls_episode_to_mp4(
+    stream_data, out_mp4_path, out_vtt_path=None, progress_cb=None, cancel_cb=None, mode="sub"
+):
+    stream_url = stream_data["url"]
+    master_url = stream_data.get("master_url") or stream_url
+    referer = stream_data.get("referrer") or "https://zokoanime.video/"
+    sub_url = stream_data.get("sub_url")
+
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     try:
-        raw_bytes = _fetch_upstream_bytes(playlist_url, referer, timeout=15, session=session)
-        playlist_text = raw_bytes.decode("utf-8", errors="replace")
+        # Download subtitle if available
+        has_sub = False
+        if sub_url and out_vtt_path:
+            try:
+                sub_bytes = _fetch_upstream_bytes(sub_url, referer, timeout=15, session=session)
+                if sub_bytes:
+                    with open(out_vtt_path, "wb") as sf:
+                        sf.write(sub_bytes)
+                    has_sub = True
+            except Exception as e:
+                print(f"Warning: subtitle download failed ({sub_url}): {e}")
 
-        lines = [ln.strip() for ln in playlist_text.splitlines() if ln.strip()]
+        # Inspect master playlist to find highest-res video playlist + any separate audio rendition playlist
+        video_playlist_url = stream_url
+        audio_playlist_url = None
+        try:
+            master_bytes = _fetch_upstream_bytes(master_url, referer, timeout=15, session=session)
+            master_text = master_bytes.decode("utf-8", errors="replace")
+            master_lines = [ln.strip() for ln in master_text.splitlines() if ln.strip()]
+            if any(ln.startswith("#EXT-X-STREAM-INF") for ln in master_lines):
+                variants = []
+                for i, ln in enumerate(master_lines):
+                    if ln.startswith("#EXT-X-STREAM-INF") and "EXT-X-I-FRAME" not in ln:
+                        m_res = re.search(r"RESOLUTION=\d+x(\d+)", ln)
+                        res_h = int(m_res.group(1)) if m_res else 0
+                        if i + 1 < len(master_lines) and not master_lines[i + 1].startswith("#"):
+                            v_url = urllib.parse.urljoin(master_url, master_lines[i + 1])
+                            variants.append((res_h, v_url))
+                if variants:
+                    variants.sort(key=lambda x: x[0], reverse=True)
+                    video_playlist_url = variants[0][1]
+                audio_playlist_url = _select_audio_rendition_url(master_lines, master_url, mode=mode)
+        except Exception as e:
+            print(f"Master playlist inspection fallback ({master_url}): {e}")
 
-        # Check if this is still a master playlist
-        if any(ln.startswith("#EXT-X-STREAM-INF") for ln in lines):
-            variants = []
-            for i, ln in enumerate(lines):
-                if ln.startswith("#EXT-X-STREAM-INF") and "EXT-X-I-FRAME" not in ln:
-                    m_res = re.search(r"RESOLUTION=\d+x(\d+)", ln)
-                    res_h = int(m_res.group(1)) if m_res else 0
-                    if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
-                        v_url = urllib.parse.urljoin(playlist_url, lines[i + 1])
-                        variants.append((res_h, v_url))
-            if variants:
-                variants.sort(key=lambda x: x[0], reverse=True)
-                return _parse_and_download_hls_playlist(
-                    variants[0][1], referer, out_ts_path, progress_cb, cancel_cb, session=session
-                )
-
-        init_map_url = None
-        segment_urls = []
-        for ln in lines:
-            if ln.startswith("#EXT-X-MAP:") and 'URI="' in ln:
-                m = re.search(r'URI="([^"]+)"', ln)
-                if m:
-                    init_map_url = urllib.parse.urljoin(playlist_url, m.group(1))
-            elif not ln.startswith("#"):
-                segment_urls.append(urllib.parse.urljoin(playlist_url, ln))
-
-        if not segment_urls:
+        v_init_url, v_segments = _parse_media_playlist_segments(video_playlist_url, referer, session)
+        if not v_segments:
             raise RuntimeError("No video segments found in HLS playlist")
 
-        total_segments = len(segment_urls)
+        a_init_url, a_segments = (None, [])
+        if audio_playlist_url:
+            try:
+                a_init_url, a_segments = _parse_media_playlist_segments(audio_playlist_url, referer, session)
+            except Exception as e:
+                print(f"Warning: separate audio playlist parse failed ({audio_playlist_url}): {e}")
+
+        total_segments = len(v_segments) + len(a_segments)
         completed_segments = 0
         downloaded_bytes = 0
-        seg_Lock = threading.Lock()
+        prog_lock = threading.Lock()
 
         if progress_cb:
             progress_cb(0, total_segments, 0)
 
-        init_bytes = b""
-        if init_map_url:
-            init_bytes = _fetch_upstream_bytes(init_map_url, referer, timeout=20, session=session)
-            downloaded_bytes += len(init_bytes)
+        def on_chunk(seg_inc, byte_inc):
+            nonlocal completed_segments, downloaded_bytes
+            with prog_lock:
+                completed_segments += seg_inc
+                downloaded_bytes += byte_inc
+                if progress_cb:
+                    progress_cb(completed_segments, total_segments, downloaded_bytes)
 
-        # Download segments in batches using persistent HTTP connections to avoid DNS/socket exhaustion
-        BATCH_SIZE = 20
-        with open(out_ts_path, "wb") as out_f:
-            if init_bytes:
-                out_f.write(init_bytes)
+        with tempfile.TemporaryDirectory(dir=ANIME_CACHE_DIR) as tmpdir:
+            temp_video_ts = os.path.join(tmpdir, "video.ts")
+            _download_segment_list_to_file(
+                v_init_url,
+                v_segments,
+                referer,
+                temp_video_ts,
+                session=session,
+                cancel_cb=cancel_cb,
+                on_chunk_cb=on_chunk,
+            )
 
-            for batch_start in range(0, total_segments, BATCH_SIZE):
-                if cancel_cb and cancel_cb():
-                    raise InterruptedError("Download cancelled")
+            temp_audio_ts = None
+            if a_segments:
+                temp_audio_ts = os.path.join(tmpdir, "audio.ts")
+                _download_segment_list_to_file(
+                    a_init_url,
+                    a_segments,
+                    referer,
+                    temp_audio_ts,
+                    session=session,
+                    cancel_cb=cancel_cb,
+                    on_chunk_cb=on_chunk,
+                )
 
-                batch = segment_urls[batch_start : batch_start + BATCH_SIZE]
-                batch_results = [None] * len(batch)
+            if cancel_cb and cancel_cb():
+                raise InterruptedError("Download cancelled")
 
-                def _dl_one(idx, s_url):
-                    if cancel_cb and cancel_cb():
-                        raise InterruptedError("Download cancelled")
-                    data = _fetch_upstream_bytes(s_url, referer, timeout=25, session=session)
-                    return idx, data
+            temp_mp4 = os.path.join(tmpdir, "remuxed.mp4")
+            remuxed_ok = False
 
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    futures = [pool.submit(_dl_one, i, u) for i, u in enumerate(batch)]
-                    for fut in as_completed(futures):
-                        if cancel_cb and cancel_cb():
-                            raise InterruptedError("Download cancelled")
-                        idx, data = fut.result()
-                        batch_results[idx] = data
-                        with seg_Lock:
-                            completed_segments += 1
-                            downloaded_bytes += len(data)
-                            if progress_cb:
-                                progress_cb(completed_segments, total_segments, downloaded_bytes)
+            if temp_audio_ts and os.path.exists(temp_audio_ts):
+                if has_sub and out_vtt_path and os.path.exists(out_vtt_path):
+                    cmd_with_sub = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        temp_video_ts,
+                        "-i",
+                        temp_audio_ts,
+                        "-i",
+                        out_vtt_path,
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-map",
+                        "2:s:0",
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "copy",
+                        "-c:s",
+                        "mov_text",
+                        "-metadata:s:s:0",
+                        "language=eng",
+                        "-movflags",
+                        "+faststart",
+                        temp_mp4,
+                    ]
+                    res = subprocess.run(cmd_with_sub, capture_output=True, text=True)
+                    if res.returncode == 0 and os.path.exists(temp_mp4) and os.path.getsize(temp_mp4) > 0:
+                        remuxed_ok = True
 
-                for chunk_bytes in batch_results:
-                    if chunk_bytes:
-                        out_f.write(chunk_bytes)
+                if not remuxed_ok:
+                    cmd_no_sub = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        temp_video_ts,
+                        "-i",
+                        temp_audio_ts,
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        temp_mp4,
+                    ]
+                    res = subprocess.run(cmd_no_sub, capture_output=True, text=True)
+                    if res.returncode != 0 or not os.path.exists(temp_mp4):
+                        raise RuntimeError(
+                            f"FFmpeg audio+video remux failed: {res.stderr[-300:] if res.stderr else 'unknown error'}"
+                        )
+            else:
+                if has_sub and out_vtt_path and os.path.exists(out_vtt_path):
+                    cmd_with_sub = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        temp_video_ts,
+                        "-i",
+                        out_vtt_path,
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "copy",
+                        "-c:s",
+                        "mov_text",
+                        "-metadata:s:s:0",
+                        "language=eng",
+                        "-movflags",
+                        "+faststart",
+                        temp_mp4,
+                    ]
+                    res = subprocess.run(cmd_with_sub, capture_output=True, text=True)
+                    if res.returncode == 0 and os.path.exists(temp_mp4) and os.path.getsize(temp_mp4) > 0:
+                        remuxed_ok = True
 
-        return total_segments, downloaded_bytes
+                if not remuxed_ok:
+                    cmd_no_sub = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        temp_video_ts,
+                        "-c",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        temp_mp4,
+                    ]
+                    res = subprocess.run(cmd_no_sub, capture_output=True, text=True)
+                    if res.returncode != 0 or not os.path.exists(temp_mp4):
+                        raise RuntimeError(
+                            f"FFmpeg remux failed: {res.stderr[-300:] if res.stderr else 'unknown error'}"
+                        )
+
+            os.makedirs(os.path.dirname(out_mp4_path), exist_ok=True)
+            shutil.move(temp_mp4, out_mp4_path)
     finally:
-        if own_session:
-            session.close()
-
-
-def download_hls_episode_to_mp4(stream_data, out_mp4_path, out_vtt_path=None, progress_cb=None, cancel_cb=None):
-    stream_url = stream_data["url"]
-    referer = stream_data.get("referrer") or "https://zokoanime.video/"
-    sub_url = stream_data.get("sub_url")
-
-    # Download subtitle if available
-    has_sub = False
-    if sub_url and out_vtt_path:
-        try:
-            sub_bytes = _fetch_upstream_bytes(sub_url, referer, timeout=15)
-            if sub_bytes:
-                with open(out_vtt_path, "wb") as sf:
-                    sf.write(sub_bytes)
-                has_sub = True
-        except Exception as e:
-            print(f"Warning: subtitle download failed ({sub_url}): {e}")
-
-    with tempfile.TemporaryDirectory(dir=ANIME_CACHE_DIR) as tmpdir:
-        temp_ts = os.path.join(tmpdir, "video.ts")
-        total_segs, dl_bytes = _parse_and_download_hls_playlist(
-            stream_url, referer, temp_ts, progress_cb=progress_cb, cancel_cb=cancel_cb
-        )
-
-        if cancel_cb and cancel_cb():
-            raise InterruptedError("Download cancelled")
-
-        temp_mp4 = os.path.join(tmpdir, "remuxed.mp4")
-
-        remuxed_ok = False
-        if has_sub and out_vtt_path and os.path.exists(out_vtt_path):
-            cmd_with_sub = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                temp_ts,
-                "-i",
-                out_vtt_path,
-                "-c:v",
-                "copy",
-                "-c:a",
-                "copy",
-                "-c:s",
-                "mov_text",
-                "-metadata:s:s:0",
-                "language=eng",
-                "-movflags",
-                "+faststart",
-                temp_mp4,
-            ]
-            res = subprocess.run(cmd_with_sub, capture_output=True, text=True)
-            if res.returncode == 0 and os.path.exists(temp_mp4) and os.path.getsize(temp_mp4) > 0:
-                remuxed_ok = True
-
-        if not remuxed_ok:
-            cmd_no_sub = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                temp_ts,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                temp_mp4,
-            ]
-            res = subprocess.run(cmd_no_sub, capture_output=True, text=True)
-            if res.returncode != 0 or not os.path.exists(temp_mp4):
-                raise RuntimeError(f"FFmpeg remux failed: {res.stderr[-300:] if res.stderr else 'unknown error'}")
-
-        os.makedirs(os.path.dirname(out_mp4_path), exist_ok=True)
-        shutil.move(temp_mp4, out_mp4_path)
+        session.close()
 
     return os.path.getsize(out_mp4_path)
 
@@ -2351,6 +2500,32 @@ def _emit_job_update(job, force=False):
         socketio.emit("download_job_updated", public_job)
     except Exception:
         pass
+
+
+def _mp4_has_audio_stream(mp4_path):
+    if not mp4_path or not os.path.exists(mp4_path):
+        return False
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                mp4_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool(res.stdout.strip())
+    except Exception:
+        return True
 
 
 def _process_download_job(job_id):
@@ -2378,11 +2553,14 @@ def _process_download_job(job_id):
         canonical_name = rec["name"] if rec else anime_name
         job["anime_name"] = canonical_name
 
-        # If target is "local" and episode is already cached on website, serve cached file immediately!
+        # If target is "local" and episode is already cached on website (with audio), serve cached file immediately!
         existing_cache = get_cached_episode_record(canonical_name, ep_num, mode)
-        if existing_cache and os.path.exists(existing_cache["video_path"]):
+        if (
+            existing_cache
+            and os.path.exists(existing_cache["video_path"])
+            and _mp4_has_audio_stream(existing_cache["video_path"])
+        ):
             if target == "local":
-                job[" _file_path"] = existing_cache["video_path"]
                 job["_file_path"] = existing_cache["video_path"]
                 job["downloaded_bytes"] = existing_cache["file_size"] or os.path.getsize(existing_cache["video_path"])
                 job["progress"] = 100.0
@@ -2470,7 +2648,7 @@ def _process_download_job(job_id):
                 conn.close()
 
             final_size = download_hls_episode_to_mp4(
-                stream_data, out_mp4, out_vtt, progress_cb=on_progress, cancel_cb=is_cancelled
+                stream_data, out_mp4, out_vtt, progress_cb=on_progress, cancel_cb=is_cancelled, mode=mode
             )
 
             skip_data = stream_data.get("skip")
@@ -2520,7 +2698,7 @@ def _process_download_job(job_id):
             export_mp4 = os.path.join(EXPORT_CACHE_DIR, f"{job_id}.mp4")
             export_vtt = os.path.join(EXPORT_CACHE_DIR, f"{job_id}.vtt")
             final_size = download_hls_episode_to_mp4(
-                stream_data, export_mp4, export_vtt, progress_cb=on_progress, cancel_cb=is_cancelled
+                stream_data, export_mp4, export_vtt, progress_cb=on_progress, cancel_cb=is_cancelled, mode=mode
             )
             if os.path.exists(export_vtt):
                 try:
