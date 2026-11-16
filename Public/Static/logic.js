@@ -2,6 +2,7 @@
 const searchView = document.getElementById("search-view");
 const libraryView = document.getElementById("library-view");
 const watchView = document.getElementById("watch-view");
+const adminView = document.getElementById("admin-view");
 const searchForm = document.getElementById("search-form");
 const searchInput = document.getElementById("search-input");
 const resultsGrid = document.getElementById("results-grid");
@@ -15,6 +16,7 @@ const logoHomeBtn = document.getElementById("logo-home-btn");
 const navMainBtn = document.getElementById("nav-main-btn");
 const navLibraryBtn = document.getElementById("nav-library-btn");
 const navDownloadsBtn = document.getElementById("nav-downloads-btn");
+const navAdminBtn = document.getElementById("nav-admin-btn");
 const libraryCountBadge = document.getElementById("library-count-badge");
 const downloadsActiveBadge = document.getElementById("downloads-active-badge");
 const librarySearchInput = document.getElementById("library-search-input");
@@ -74,15 +76,37 @@ let currentStreamFetchId = 0;
 let idleTimer;
 let isRemoteAction = false;
 
-// --- Sync Toggle State ---
+// Account & Room Sync State
+let currentUser = null;
+let authToken = localStorage.getItem("syncwatch_token") || "";
+let currentRoom = null;
+let publicRoomsList = [];
+let lastEpisodeTimeSyncAt = 0;
+
+// --- Sync Toggle State (Room-Based Sync) ---
 const syncToggle = document.getElementById("sync-toggle");
-let isSyncEnabled = localStorage.getItem("syncEnabled") === "true";
-if (syncToggle) syncToggle.checked = isSyncEnabled;
+let isSyncEnabled = false;
+if (syncToggle) syncToggle.checked = false;
+
+function isRoomSyncActive() {
+  return Boolean(currentRoom && isSyncEnabled && typeof socket !== "undefined" && socket);
+}
 
 if (syncToggle) {
   syncToggle.addEventListener("change", (e) => {
+    if (!currentRoom) {
+      e.target.checked = false;
+      isSyncEnabled = false;
+      openRoomsModal();
+      showToast("Create or join a Sync Room to watch together with friends!");
+      return;
+    }
     isSyncEnabled = e.target.checked;
-    localStorage.setItem("syncEnabled", isSyncEnabled);
+    showToast(
+      isSyncEnabled
+        ? `Room sync active in "${currentRoom.name}"`
+        : "Room sync temporarily paused for you",
+    );
   });
 }
 
@@ -134,7 +158,7 @@ videoPlayer.addEventListener("play", () => {
     return;
   }
 
-  if (isSyncEnabled && typeof socket !== "undefined") {
+  if (isRoomSyncActive()) {
     socket.emit("play_action", { time: videoPlayer.currentTime });
   }
 });
@@ -143,12 +167,16 @@ videoPlayer.addEventListener("pause", () => {
   playPauseBtn.textContent = "▶";
   videoWrapper.classList.add("paused");
 
+  if (currentShowId && currentEpNum && videoPlayer.currentTime > 0) {
+    flushEpisodeTimeToAccount(currentShowId, currentEpNum, videoPlayer.currentTime);
+  }
+
   if (isRemoteAction) {
     isRemoteAction = false;
     return;
   }
 
-  if (isSyncEnabled && typeof socket !== "undefined") {
+  if (isRoomSyncActive()) {
     socket.emit("pause_action", { time: videoPlayer.currentTime });
   }
 });
@@ -159,7 +187,7 @@ videoPlayer.addEventListener("seeked", () => {
     return;
   }
 
-  if (isSyncEnabled && typeof socket !== "undefined") {
+  if (isRoomSyncActive()) {
     socket.emit("seek_action", { time: videoPlayer.currentTime });
   }
 });
@@ -312,7 +340,7 @@ backBtn.addEventListener("click", () => {
     updateURL("");
     showSearchView();
   }
-  if (isSyncEnabled && typeof socket !== "undefined") {
+  if (isRoomSyncActive()) {
     socket.emit("back_action");
   }
 });
@@ -338,6 +366,13 @@ if (navLibraryBtn) {
   });
 }
 
+if (navAdminBtn) {
+  navAdminBtn.addEventListener("click", () => {
+    updateURL("", "", "", "admin");
+    showAdminView();
+  });
+}
+
 if (libraryBrowseBtn) {
   libraryBrowseBtn.addEventListener("click", () => {
     updateURL("");
@@ -354,7 +389,9 @@ if (librarySearchInput) {
 modeToggle.addEventListener("change", () => {
   modeToggle.blur();
   if (currentShowId) {
-    localStorage.setItem(`langPref_${currentShowId}`, modeToggle.value);
+    const key = `langPref_${currentShowId}`;
+    localStorage.setItem(key, modeToggle.value);
+    syncAccountProgressDelta({ langPrefs: { [key]: modeToggle.value } });
     loadEpisodes(currentShowId, currentShowName, currentEpNum);
   }
 });
@@ -372,7 +409,9 @@ function playNextEpisode() {
     }, 2000);
 
     if (currentShowId && currentEpNum) {
-      localStorage.removeItem(`save_${currentShowId}_${currentEpNum}`);
+      const saveKey = `save_${currentShowId}_${currentEpNum}`;
+      localStorage.removeItem(saveKey);
+      syncAccountProgressDelta({ deletedEpisodeTimes: [saveKey] });
     }
 
     const nextEp = currentEpisodeList[currentIndex + 1];
@@ -393,7 +432,9 @@ if (playerNextEpBtn) {
 
 videoPlayer.addEventListener("ended", () => {
   if (currentShowId && currentEpNum) {
-    localStorage.removeItem(`save_${currentShowId}_${currentEpNum}`);
+    const saveKey = `save_${currentShowId}_${currentEpNum}`;
+    localStorage.removeItem(saveKey);
+    syncAccountProgressDelta({ deletedEpisodeTimes: [saveKey] });
   }
   if (isAutoplayEnabled) {
     playNextEpisode();
@@ -404,6 +445,7 @@ autoplayCheckbox.checked = isAutoplayEnabled;
 autoplayCheckbox.addEventListener("change", (e) => {
   isAutoplayEnabled = e.target.checked;
   localStorage.setItem("autoplayEnabled", isAutoplayEnabled);
+  syncAccountProgressDelta({ settings: { autoplayEnabled: isAutoplayEnabled } });
 });
 
 if ("mediaSession" in navigator) {
@@ -413,6 +455,7 @@ if ("mediaSession" in navigator) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  await initAuthSession();
   await fetchLibraryData();
   fetchDownloadJobs();
   renderContinueWatching();
@@ -427,6 +470,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     loadEpisodes(showId, showName, epNum);
   } else if (viewParam === "library") {
     showLibraryView();
+  } else if (viewParam === "admin" && currentUser && currentUser.is_admin) {
+    showAdminView();
   } else {
     showSearchView();
   }
@@ -435,6 +480,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 function updateURL(showId, showName, epNum, viewMode = "") {
   if (viewMode === "library") {
     window.history.pushState({}, "", "/?view=library");
+  } else if (viewMode === "admin") {
+    window.history.pushState({}, "", "/?view=admin");
   } else if (!showId || showId === "undefined" || showId === "null") {
     window.history.pushState({}, "", "/");
   } else {
@@ -451,6 +498,8 @@ window.addEventListener("popstate", () => {
     loadEpisodes(showId, params.get("name"), params.get("ep"));
   } else if (viewParam === "library") {
     showLibraryView();
+  } else if (viewParam === "admin" && currentUser && currentUser.is_admin) {
+    showAdminView();
   } else {
     showSearchView();
   }
@@ -525,7 +574,7 @@ async function handleSearch(e) {
   const query = searchInput.value.trim();
   if (!query) return;
 
-  if (isSyncEnabled && typeof socket !== "undefined") {
+  if (isRoomSyncActive()) {
     socket.emit("search_action", { query: query });
   }
 
@@ -717,7 +766,7 @@ async function loadEpisodes(
 
   videoPlayer.pause();
 
-  if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
+  if (!isRemote && isRoomSyncActive()) {
     socket.emit("load_show_action", { showId, showName, targetEpNum });
   }
 
@@ -864,7 +913,7 @@ async function playVideo(epNum, isRemote = false) {
   currentStreamFetchId++;
   const fetchId = currentStreamFetchId;
 
-  if (!isRemote && isSyncEnabled && typeof socket !== "undefined") {
+  if (!isRemote && isRoomSyncActive()) {
     socket.emit("load_episode_action", { epNum });
   }
 
@@ -1013,9 +1062,9 @@ async function playVideo(epNum, isRemote = false) {
         });
       }
 
-      if (isSyncEnabled) {
+      if (isRoomSyncActive() && currentRoom && currentRoom.member_count > 1) {
         videoPlayer.pause();
-        videoOverlay.innerHTML = "Waiting for friend to buffer...";
+        videoOverlay.innerHTML = "Waiting for room members to buffer...";
         videoOverlay.classList.remove("hidden");
       } else {
         videoPlayer
@@ -1085,9 +1134,11 @@ function showSearchView() {
   lastBrowseWindow = "main";
   searchView.classList.remove("hidden");
   if (libraryView) libraryView.classList.add("hidden");
+  if (adminView) adminView.classList.add("hidden");
   watchView.classList.add("hidden");
   if (navMainBtn) navMainBtn.classList.add("active");
   if (navLibraryBtn) navLibraryBtn.classList.remove("active");
+  if (navAdminBtn) navAdminBtn.classList.remove("active");
   stopPlayerMedia();
 
   // Clear search input so home page features (schedule, continue watching) reappear
@@ -1105,16 +1156,36 @@ function showLibraryView() {
   lastBrowseWindow = "library";
   searchView.classList.add("hidden");
   if (libraryView) libraryView.classList.remove("hidden");
+  if (adminView) adminView.classList.add("hidden");
   watchView.classList.add("hidden");
   if (navMainBtn) navMainBtn.classList.remove("active");
   if (navLibraryBtn) navLibraryBtn.classList.add("active");
+  if (navAdminBtn) navAdminBtn.classList.remove("active");
   stopPlayerMedia();
   fetchLibraryData();
+}
+
+function showAdminView() {
+  if (!currentUser || !currentUser.is_admin) {
+    showToast("Admin privileges are required to view the Admin Dashboard.");
+    showSearchView();
+    return;
+  }
+  searchView.classList.add("hidden");
+  if (libraryView) libraryView.classList.add("hidden");
+  watchView.classList.add("hidden");
+  if (adminView) adminView.classList.remove("hidden");
+  if (navMainBtn) navMainBtn.classList.remove("active");
+  if (navLibraryBtn) navLibraryBtn.classList.remove("active");
+  if (navAdminBtn) navAdminBtn.classList.add("active");
+  stopPlayerMedia();
+  fetchAdminDashboardData();
 }
 
 function showWatchView() {
   searchView.classList.add("hidden");
   if (libraryView) libraryView.classList.add("hidden");
+  if (adminView) adminView.classList.add("hidden");
   watchView.classList.remove("hidden");
   if (backBtn) {
     backBtn.textContent =
@@ -1126,7 +1197,7 @@ function showWatchView() {
 }
 
 // ==========================================
-// Socket.IO State Machine & Sync Protocol
+// Socket.IO State Machine & Room Sync Protocol
 // ==========================================
 const socket = typeof io !== "undefined" ? io() : null;
 
@@ -1141,8 +1212,14 @@ videoPlayer.addEventListener("canplay", () => {
 });
 
 if (socket) {
+  socket.on("connect", () => {
+    if (authToken) {
+      socket.emit("authenticate_socket", { token: authToken });
+    }
+  });
+
   socket.on("receive_search", async (data) => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
     searchInput.value = data.query;
 
     if (scheduleContainer) scheduleContainer.classList.add("hidden");
@@ -1163,12 +1240,12 @@ if (socket) {
   });
 
   socket.on("receive_load_show", (data) => {
-    if (!isSyncEnabled) return;
-    loadEpisodes(data.showId, data.showName, data.targetEpNum, true);
+    if (!isRoomSyncActive()) return;
+    loadEpisodes(data.showId, data.showName || data.showId, data.targetEpNum, true);
   });
 
   socket.on("receive_load_episode", (data) => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
     document.querySelectorAll(".ep-btn").forEach((b) => {
       b.classList.remove("active");
       if (b.textContent == data.epNum) b.classList.add("active");
@@ -1177,13 +1254,13 @@ if (socket) {
   });
 
   socket.on("receive_back", () => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
     updateURL("");
     showSearchView();
   });
 
   socket.on("receive_play", (data) => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
     isRemoteAction = true;
     if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
       videoPlayer.currentTime = data.time;
@@ -1203,7 +1280,7 @@ if (socket) {
   });
 
   socket.on("receive_pause", (data) => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
     isRemoteAction = true;
     videoPlayer.pause();
     if (Math.abs(videoPlayer.currentTime - data.time) > 1) {
@@ -1212,14 +1289,12 @@ if (socket) {
   });
 
   socket.on("receive_seek", (data) => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
     isRemoteAction = true;
     videoPlayer.currentTime = data.time;
   });
 
   socket.on("request_heartbeat", () => {
-    if (!isSyncEnabled) return;
-
     let currentStatus = watchView.classList.contains("hidden")
       ? "browsing"
       : "watching";
@@ -1241,33 +1316,39 @@ if (socket) {
       video_state: vidState,
       time: videoPlayer.currentTime || 0,
       showId: currentShowId,
+      showName: currentShowName,
       epNum: currentEpNum,
     });
   });
 
   socket.on("force_load", (data) => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
     if (currentShowId !== data.showId || currentEpNum !== data.epNum) {
-      console.log("Sync: Pulled into friend's watch party.");
-      loadEpisodes(data.showId, "Watch Party", data.epNum, true);
+      console.log("Sync: Pulled into room's active watch party.");
+      loadEpisodes(
+        data.showId,
+        data.showName || data.showId || "Watch Party",
+        data.epNum,
+        true,
+      );
     }
   });
 
   socket.on("sync_correction", (cmd) => {
-    if (!isSyncEnabled) return;
+    if (!isRoomSyncActive()) return;
 
     if (cmd.action === "pause_for_buffer") {
       if (!videoPlayer.paused) {
         isRemoteAction = true;
         videoPlayer.pause();
-        videoOverlay.innerHTML = "Waiting for friend to buffer...";
+        videoOverlay.innerHTML = "Waiting for room members to buffer...";
         videoOverlay.classList.remove("hidden");
       }
     } else if (cmd.action === "pause_timeout") {
       if (!videoPlayer.paused) {
         isRemoteAction = true;
         videoPlayer.pause();
-        videoOverlay.innerHTML = "Syncing... Waiting for friend to catch up.";
+        videoOverlay.innerHTML = "Syncing... Waiting for room to catch up.";
         videoOverlay.classList.remove("hidden");
 
         setTimeout(() => {
@@ -1295,12 +1376,12 @@ if (socket) {
               "Browser Blocked Autoplay.<br><br><b>Click Here to Start Sync</b>";
             videoOverlay.classList.remove("hidden");
           });
-      } else if (cmd.action === "resync_time") {
-        isRemoteAction = true;
-        videoPlayer.currentTime = cmd.target_time;
       } else {
         videoOverlay.classList.add("hidden");
       }
+    } else if (cmd.action === "resync_time") {
+      isRemoteAction = true;
+      videoPlayer.currentTime = cmd.target_time;
     }
   });
 }
@@ -1433,6 +1514,7 @@ async function fetchSeasonal(year, season) {
 
       // Save the updated snapshot
       localStorage.setItem(trackerKey, JSON.stringify(updatedTracker));
+      syncAccountProgressDelta({ seasonTrackers: { [trackerKey]: updatedTracker } });
 
       // Sort array: Push 'isNew = true' items to the top
       animeList.sort((a, b) => (b.isNew === true ? 1 : 0) - (a.isNew === true ? 1 : 0));
@@ -1499,6 +1581,7 @@ function renderSeasonal(animeList, trackerKey) {
       if (tracker[id]) {
           tracker[id].isNew = false;
           localStorage.setItem(trackerKey, JSON.stringify(tracker));
+          syncAccountProgressDelta({ seasonTrackers: { [trackerKey]: tracker } });
       }
       const badge = card.querySelector('.new-badge');
       if (badge) badge.remove();
@@ -1533,6 +1616,7 @@ function updateWatchHistory(showId, showName, epNum) {
   if (history.length > 15) history.pop();
 
   localStorage.setItem("watchHistory", JSON.stringify(history));
+  syncAccountProgressDelta({ watchHistory: history });
 }
 
 function deleteFromWatchHistory(item) {
@@ -1558,6 +1642,11 @@ function deleteFromWatchHistory(item) {
     }
   }
   keysToRemove.forEach((key) => localStorage.removeItem(key));
+
+  syncAccountProgressDelta({
+    watchHistory: history,
+    clearEpisodePrefixes: prefixes,
+  });
 
   renderContinueWatching();
 }
@@ -1616,7 +1705,7 @@ function renderContinueWatching() {
     }
 
     card.addEventListener("click", () => {
-      if (isSyncEnabled && socket) {
+      if (isRoomSyncActive()) {
         socket.emit("load_show_action", {
           showId: showKey,
           showName: item.name,
@@ -1667,13 +1756,20 @@ videoPlayer.addEventListener("timeupdate", () => {
   timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
 
   if (currentShowId && currentEpNum && currentTime > 0) {
+    const saveKey = `save_${currentShowId}_${currentEpNum}`;
     if (
       videoPlayer.ended ||
       (videoPlayer.duration && videoPlayer.duration - currentTime <= 5)
     ) {
-      localStorage.removeItem(`save_${currentShowId}_${currentEpNum}`);
+      localStorage.removeItem(saveKey);
+      syncAccountProgressDelta({ deletedEpisodeTimes: [saveKey] });
     } else {
-      localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, currentTime);
+      localStorage.setItem(saveKey, currentTime);
+      const nowMs = Date.now();
+      if (nowMs - lastEpisodeTimeSyncAt > 4000) {
+        lastEpisodeTimeSyncAt = nowMs;
+        flushEpisodeTimeToAccount(currentShowId, currentEpNum, currentTime);
+      }
     }
   }
 
@@ -2620,3 +2716,1328 @@ if (socket) {
     }
   });
 }
+
+// ==========================================
+// 6. Toast Notifications Helper
+// ==========================================
+const toastContainer = document.getElementById("toast-container");
+
+function showToast(message, durationMs = 4000) {
+  if (!toastContainer || !message) return;
+  const item = document.createElement("div");
+  item.className = "toast-item";
+  item.textContent = message;
+  toastContainer.appendChild(item);
+  setTimeout(() => {
+    item.remove();
+  }, durationMs);
+}
+
+function getAuthHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (authToken) {
+    headers["Authorization"] = `Bearer ${authToken}`;
+  }
+  return headers;
+}
+
+// ==========================================
+// 7. Account System & LocalStorage Progress Sync
+// ==========================================
+const headerAccountBtn = document.getElementById("header-account-btn");
+const headerAccountLabel = document.getElementById("header-account-label");
+const headerAdminBadge = document.getElementById("header-admin-badge");
+const authModalBackdrop = document.getElementById("auth-modal-backdrop");
+const closeAuthModalBtn = document.getElementById("close-auth-modal-btn");
+const authGuestSection = document.getElementById("auth-guest-section");
+const authProfileSection = document.getElementById("auth-profile-section");
+const authTabLoginBtn = document.getElementById("auth-tab-login-btn");
+const authTabRegisterBtn = document.getElementById("auth-tab-register-btn");
+const authForm = document.getElementById("auth-form");
+const authUsernameInput = document.getElementById("auth-username-input");
+const authPasswordInput = document.getElementById("auth-password-input");
+const authErrorMsg = document.getElementById("auth-error-msg");
+const authSubmitBtn = document.getElementById("auth-submit-btn");
+
+const profileUsernameDisplay = document.getElementById("profile-username-display");
+const profileRoleBadge = document.getElementById("profile-role-badge");
+const profileProgressStats = document.getElementById("profile-progress-stats");
+const profileSyncNowBtn = document.getElementById("profile-sync-now-btn");
+const profileOpenAdminBtn = document.getElementById("profile-open-admin-btn");
+const changePasswordForm = document.getElementById("change-password-form");
+const authLogoutBtn = document.getElementById("auth-logout-btn");
+
+let authMode = "login"; // "login" or "register"
+
+function collectLocalStorageProgress() {
+  let watchHistory = [];
+  try {
+    watchHistory = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+    if (!Array.isArray(watchHistory)) watchHistory = [];
+  } catch (e) {
+    watchHistory = [];
+  }
+
+  const episodeTimes = {};
+  const langPrefs = {};
+  const seasonTrackers = {};
+
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (!k) continue;
+    if (k.startsWith("save_")) {
+      const val = parseFloat(localStorage.getItem(k));
+      if (!isNaN(val) && val > 0) {
+        episodeTimes[k] = val;
+      }
+    } else if (k.startsWith("langPref_")) {
+      const val = localStorage.getItem(k);
+      if (val === "sub" || val === "dub") {
+        langPrefs[k] = val;
+      }
+    } else if (k.startsWith("season_tracker_")) {
+      try {
+        const obj = JSON.parse(localStorage.getItem(k) || "{}");
+        if (obj && typeof obj === "object") {
+          seasonTrackers[k] = obj;
+        }
+      } catch (e) {}
+    }
+  }
+
+  const settings = {
+    autoplayEnabled: localStorage.getItem("autoplayEnabled") !== "false",
+  };
+
+  return {
+    watchHistory,
+    episodeTimes,
+    langPrefs,
+    seasonTrackers,
+    settings,
+  };
+}
+
+function clearUserSpecificLocalStorage() {
+  const keysToDelete = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (
+      k &&
+      (k.startsWith("save_") ||
+        k.startsWith("langPref_") ||
+        k.startsWith("season_tracker_"))
+    ) {
+      keysToDelete.push(k);
+    }
+  }
+  keysToDelete.forEach((k) => localStorage.removeItem(k));
+  localStorage.removeItem("watchHistory");
+  localStorage.removeItem("progressOwnerUser");
+}
+
+function applyAccountProgressToLocalStorage(progress, username) {
+  if (!progress || typeof progress !== "object") return;
+
+  clearUserSpecificLocalStorage();
+
+  if (Array.isArray(progress.watchHistory)) {
+    localStorage.setItem("watchHistory", JSON.stringify(progress.watchHistory));
+  }
+
+  if (progress.episodeTimes && typeof progress.episodeTimes === "object") {
+    Object.entries(progress.episodeTimes).forEach(([k, v]) => {
+      if (k.startsWith("save_") && Number(v) > 0) {
+        localStorage.setItem(k, String(v));
+      }
+    });
+  }
+
+  if (progress.langPrefs && typeof progress.langPrefs === "object") {
+    Object.entries(progress.langPrefs).forEach(([k, v]) => {
+      if (k.startsWith("langPref_") && (v === "sub" || v === "dub")) {
+        localStorage.setItem(k, v);
+      }
+    });
+  }
+
+  if (progress.seasonTrackers && typeof progress.seasonTrackers === "object") {
+    Object.entries(progress.seasonTrackers).forEach(([k, v]) => {
+      if (k.startsWith("season_tracker_") && v && typeof v === "object") {
+        localStorage.setItem(k, JSON.stringify(v));
+      }
+    });
+  }
+
+  if (progress.settings && typeof progress.settings === "object") {
+    if (typeof progress.settings.autoplayEnabled === "boolean") {
+      isAutoplayEnabled = progress.settings.autoplayEnabled;
+      localStorage.setItem("autoplayEnabled", String(isAutoplayEnabled));
+      if (autoplayCheckbox) autoplayCheckbox.checked = isAutoplayEnabled;
+    }
+  }
+
+  if (username) {
+    localStorage.setItem("progressOwnerUser", username);
+  }
+
+  renderContinueWatching();
+  updateProfileStatsUI(progress);
+}
+
+function updateProfileStatsUI(progress) {
+  if (!profileProgressStats) return;
+  const p = progress || collectLocalStorageProgress();
+  const hCount = Array.isArray(p.watchHistory) ? p.watchHistory.length : 0;
+  const eCount =
+    p.episodeTimes && typeof p.episodeTimes === "object"
+      ? Object.keys(p.episodeTimes).length
+      : 0;
+  profileProgressStats.textContent = `${hCount} show${hCount === 1 ? "" : "s"} in Continue Watching • ${eCount} saved episode timestamp${eCount === 1 ? "" : "s"}`;
+}
+
+async function syncAccountProgressDelta(deltaPayload, mode = "update") {
+  if (!currentUser || !authToken) return;
+  try {
+    await fetch("/api/account/progress", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ mode, ...deltaPayload }),
+    });
+  } catch (err) {
+    console.warn("Could not sync progress to account:", err);
+  }
+}
+
+function flushEpisodeTimeToAccount(showId, epNum, currentTime) {
+  if (!currentUser || !showId || !epNum) return;
+  const saveKey = `save_${showId}_${epNum}`;
+  syncAccountProgressDelta({
+    episodeTimes: { [saveKey]: Math.round(currentTime * 100) / 100 },
+  });
+}
+
+function updateAuthUI() {
+  if (currentUser) {
+    if (headerAccountLabel) headerAccountLabel.textContent = currentUser.username;
+    if (headerAdminBadge) {
+      headerAdminBadge.classList.toggle("hidden", !currentUser.is_admin);
+    }
+    if (navAdminBtn) {
+      navAdminBtn.classList.toggle("hidden", !currentUser.is_admin);
+    }
+    if (authGuestSection) authGuestSection.classList.add("hidden");
+    if (authProfileSection) authProfileSection.classList.remove("hidden");
+    if (profileUsernameDisplay) {
+      profileUsernameDisplay.textContent = currentUser.username;
+    }
+    if (profileRoleBadge) {
+      profileRoleBadge.textContent = currentUser.is_admin ? "ADMIN" : "MEMBER";
+    }
+    if (profileOpenAdminBtn) {
+      profileOpenAdminBtn.classList.toggle("hidden", !currentUser.is_admin);
+    }
+    updateProfileStatsUI();
+  } else {
+    if (headerAccountLabel) headerAccountLabel.textContent = "Sign In";
+    if (headerAdminBadge) headerAdminBadge.classList.add("hidden");
+    if (navAdminBtn) navAdminBtn.classList.add("hidden");
+    if (authGuestSection) authGuestSection.classList.remove("hidden");
+    if (authProfileSection) authProfileSection.classList.add("hidden");
+  }
+  updateRoomsGuestBanner();
+}
+
+async function initAuthSession() {
+  try {
+    const res = await fetch("/api/auth/me", {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.authenticated && data.user) {
+      currentUser = data.user;
+      const prevOwner = localStorage.getItem("progressOwnerUser");
+      const localSnap = collectLocalStorageProgress();
+      const hasAnonymousLocalData =
+        !prevOwner &&
+        (localSnap.watchHistory.length > 0 ||
+          Object.keys(localSnap.episodeTimes).length > 0 ||
+          Object.keys(localSnap.langPrefs).length > 0);
+
+      if (hasAnonymousLocalData) {
+        const mergeRes = await fetch("/api/account/progress", {
+          method: "POST",
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ mode: "merge", ...localSnap }),
+        });
+        if (mergeRes.ok) {
+          const mergedData = await mergeRes.json();
+          applyAccountProgressToLocalStorage(
+            mergedData.progress,
+            currentUser.username,
+          );
+        } else {
+          applyAccountProgressToLocalStorage(
+            data.progress,
+            currentUser.username,
+          );
+        }
+      } else {
+        applyAccountProgressToLocalStorage(data.progress, currentUser.username);
+      }
+
+      if (socket && socket.connected) {
+        socket.emit("authenticate_socket", { token: authToken });
+      }
+    } else {
+      currentUser = null;
+      authToken = "";
+      localStorage.removeItem("syncwatch_token");
+    }
+  } catch (err) {
+    console.warn("Auth session check failed:", err);
+  }
+  updateAuthUI();
+}
+
+function setAuthTabMode(mode) {
+  authMode = mode === "register" ? "register" : "login";
+  if (authTabLoginBtn) {
+    authTabLoginBtn.classList.toggle("active", authMode === "login");
+  }
+  if (authTabRegisterBtn) {
+    authTabRegisterBtn.classList.toggle("active", authMode === "register");
+  }
+  if (authSubmitBtn) {
+    authSubmitBtn.textContent =
+      authMode === "register"
+        ? "Create Account & Import Local Progress"
+        : "Sign In & Sync Progress";
+  }
+  if (authErrorMsg) authErrorMsg.classList.add("hidden");
+}
+
+function openAuthModal(defaultMode = "login") {
+  if (!authModalBackdrop) return;
+  if (!currentUser) {
+    setAuthTabMode(defaultMode);
+  } else {
+    updateProfileStatsUI();
+  }
+  authModalBackdrop.classList.remove("hidden");
+}
+
+function closeAuthModal() {
+  if (authModalBackdrop) authModalBackdrop.classList.add("hidden");
+}
+
+if (headerAccountBtn) {
+  headerAccountBtn.addEventListener("click", () => openAuthModal("login"));
+}
+if (closeAuthModalBtn) {
+  closeAuthModalBtn.addEventListener("click", closeAuthModal);
+}
+if (authModalBackdrop) {
+  authModalBackdrop.addEventListener("click", (e) => {
+    if (e.target === authModalBackdrop) closeAuthModal();
+  });
+}
+if (authTabLoginBtn) {
+  authTabLoginBtn.addEventListener("click", () => setAuthTabMode("login"));
+}
+if (authTabRegisterBtn) {
+  authTabRegisterBtn.addEventListener("click", () => setAuthTabMode("register"));
+}
+
+if (authForm) {
+  authForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const username = (authUsernameInput?.value || "").trim();
+    const password = authPasswordInput?.value || "";
+    if (!username || !password) return;
+
+    if (authErrorMsg) authErrorMsg.classList.add("hidden");
+    if (authSubmitBtn) authSubmitBtn.disabled = true;
+
+    // Only merge browser localStorage if it was anonymous (not owned by another account) or owned by this same username
+    const prevOwner = localStorage.getItem("progressOwnerUser");
+    const shouldMigrateLocal =
+      !prevOwner || prevOwner.toLowerCase() === username.toLowerCase();
+    const localProgress = shouldMigrateLocal
+      ? collectLocalStorageProgress()
+      : null;
+
+    const endpoint =
+      authMode === "register" ? "/api/auth/register" : "/api/auth/login";
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password, localProgress }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (authErrorMsg) {
+          authErrorMsg.textContent = data.error || "Authentication failed.";
+          authErrorMsg.classList.remove("hidden");
+        }
+        return;
+      }
+
+      authToken = data.token || "";
+      if (authToken) {
+        localStorage.setItem("syncwatch_token", authToken);
+      }
+      currentUser = data.user;
+      applyAccountProgressToLocalStorage(data.progress, currentUser.username);
+      updateAuthUI();
+
+      if (socket) {
+        socket.emit("authenticate_socket", { token: authToken });
+      }
+
+      if (authPasswordInput) authPasswordInput.value = "";
+      closeAuthModal();
+      showToast(
+        authMode === "register"
+          ? `Account "${currentUser.username}" created & progress saved!`
+          : `Welcome back, ${currentUser.username}! Progress synced.`,
+      );
+    } catch (err) {
+      if (authErrorMsg) {
+        authErrorMsg.textContent = "Network error while signing in.";
+        authErrorMsg.classList.remove("hidden");
+      }
+    } finally {
+      if (authSubmitBtn) authSubmitBtn.disabled = false;
+    }
+  });
+}
+
+if (profileSyncNowBtn) {
+  profileSyncNowBtn.addEventListener("click", async () => {
+    if (!currentUser) return;
+    const snap = collectLocalStorageProgress();
+    const res = await fetch("/api/account/progress", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ mode: "merge", ...snap }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      applyAccountProgressToLocalStorage(data.progress, currentUser.username);
+      showToast("All browser progress synced to your SQLite account!");
+    }
+  });
+}
+
+if (profileOpenAdminBtn) {
+  profileOpenAdminBtn.addEventListener("click", () => {
+    closeAuthModal();
+    updateURL("", "", "", "admin");
+    showAdminView();
+  });
+}
+
+if (changePasswordForm) {
+  changePasswordForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const curEl = document.getElementById("cp-current-pw");
+    const newEl = document.getElementById("cp-new-pw");
+    const currentPassword = curEl?.value || "";
+    const newPassword = newEl?.value || "";
+    if (!currentPassword || !newPassword) return;
+
+    const res = await fetch("/api/account/password", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ currentPassword, newPassword }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || "Failed to update password.");
+      return;
+    }
+    if (curEl) curEl.value = "";
+    if (newEl) newEl.value = "";
+    showToast("Password updated successfully!");
+  });
+}
+
+if (authLogoutBtn) {
+  authLogoutBtn.addEventListener("click", async () => {
+    if (currentRoom && socket) {
+      socket.emit("leave_room_event");
+    }
+    try {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: getAuthHeaders(),
+      });
+    } catch (e) {}
+    currentUser = null;
+    authToken = "";
+    localStorage.removeItem("syncwatch_token");
+    clearUserSpecificLocalStorage();
+    renderContinueWatching();
+    updateAuthUI();
+    if (socket) {
+      socket.emit("authenticate_socket", { token: "" });
+    }
+    closeAuthModal();
+    if (adminView && !adminView.classList.contains("hidden")) {
+      updateURL("");
+      showSearchView();
+    }
+    showToast("Signed out of your account.");
+  });
+}
+
+// ==========================================
+// 8. Room-Based Syncing Service UI & Logic
+// ==========================================
+const roomSyncPill = document.getElementById("room-sync-pill");
+const openRoomsModalBtn = document.getElementById("open-rooms-modal-btn");
+const roomStatusDot = document.getElementById("room-status-dot");
+const roomHeaderLabel = document.getElementById("room-header-label");
+const roomsModalBackdrop = document.getElementById("rooms-modal-backdrop");
+const closeRoomsModalBtn = document.getElementById("close-rooms-modal-btn");
+const roomsGuestWarning = document.getElementById("rooms-guest-warning");
+const roomsSigninPromptBtn = document.getElementById("rooms-signin-prompt-btn");
+const activeRoomPanel = document.getElementById("active-room-panel");
+const activeRoomNameEl = document.getElementById("active-room-name");
+const activeRoomCodeEl = document.getElementById("active-room-code");
+const copyRoomCodeBtn = document.getElementById("copy-room-code-btn");
+const activeRoomWatchingSub = document.getElementById("active-room-watching-sub");
+const leaveRoomBtn = document.getElementById("leave-room-btn");
+const activeRoomMemberCount = document.getElementById("active-room-member-count");
+const activeRoomMembersList = document.getElementById("active-room-members-list");
+const createRoomForm = document.getElementById("create-room-form");
+const joinRoomCodeForm = document.getElementById("join-room-code-form");
+const refreshRoomsBtn = document.getElementById("refresh-rooms-btn");
+const publicRoomsDirectory = document.getElementById("public-rooms-directory");
+
+function updateRoomsGuestBanner() {
+  if (!roomsGuestWarning) return;
+  roomsGuestWarning.classList.toggle("hidden", Boolean(currentUser));
+}
+
+function updateRoomUI() {
+  if (currentRoom) {
+    if (roomSyncPill) roomSyncPill.classList.add("in-room");
+    if (roomStatusDot) {
+      roomStatusDot.classList.remove("offline");
+      roomStatusDot.classList.add("online");
+    }
+    if (roomHeaderLabel) {
+      roomHeaderLabel.textContent = `Room #${currentRoom.room_id} (${currentRoom.member_count || 1})`;
+    }
+    if (activeRoomPanel) activeRoomPanel.classList.remove("hidden");
+    if (activeRoomNameEl) activeRoomNameEl.textContent = currentRoom.name;
+    if (activeRoomCodeEl) activeRoomCodeEl.textContent = currentRoom.room_id;
+
+    const showInfo = currentRoom.current_show_name
+      ? ` • Watching: ${currentRoom.current_show_name}${currentRoom.current_ep_num ? ` (Ep ${currentRoom.current_ep_num})` : ""}`
+      : " • Browsing";
+    if (activeRoomWatchingSub) {
+      activeRoomWatchingSub.textContent = `Host: ${currentRoom.host_username}${showInfo}`;
+    }
+
+    const members = currentRoom.members || [];
+    if (activeRoomMemberCount) {
+      activeRoomMemberCount.textContent = members.length;
+    }
+    if (activeRoomMembersList) {
+      activeRoomMembersList.innerHTML = "";
+      members.forEach((m) => {
+        const row = document.createElement("div");
+        row.className = "room-member-row";
+        let stateLabel = "🌐 Browsing";
+        if (m.status === "watching") {
+          const tStr = formatTime(m.time || 0);
+          if (m.video_state === "playing") stateLabel = `▶ Playing (${tStr})`;
+          else if (m.video_state === "buffering") stateLabel = `⏳ Buffering (${tStr})`;
+          else stateLabel = `⏸ Paused (${tStr})`;
+        }
+        row.innerHTML = `
+          <div>
+            <strong>${escapeHtml(m.username)}</strong>
+            ${m.is_host ? `<span class="cached-badge" style="margin-left: 6px;">HOST</span>` : ""}
+          </div>
+          <div style="color: var(--text-muted); font-size: 0.8rem;">
+            ${escapeHtml(stateLabel)}
+          </div>
+        `;
+        activeRoomMembersList.appendChild(row);
+      });
+    }
+  } else {
+    if (roomSyncPill) roomSyncPill.classList.remove("in-room");
+    if (roomStatusDot) {
+      roomStatusDot.classList.remove("online");
+      roomStatusDot.classList.add("offline");
+    }
+    if (roomHeaderLabel) {
+      roomHeaderLabel.textContent = "🎬 Sync Rooms";
+    }
+    if (activeRoomPanel) activeRoomPanel.classList.add("hidden");
+    isSyncEnabled = false;
+    if (syncToggle) syncToggle.checked = false;
+  }
+}
+
+async function fetchPublicRooms() {
+  try {
+    const res = await fetch("/api/rooms");
+    if (!res.ok) return;
+    const data = await res.json();
+    publicRoomsList = data.rooms || [];
+    renderPublicRoomsDirectory();
+  } catch (e) {}
+}
+
+function renderPublicRoomsDirectory() {
+  if (!publicRoomsDirectory) return;
+  if (!publicRoomsList || publicRoomsList.length === 0) {
+    publicRoomsDirectory.innerHTML = `
+      <p style="color: var(--text-muted); font-size: 0.88rem; text-align: center; padding: 1rem;">
+        No active rooms right now. Create one above to start watching together!
+      </p>
+    `;
+    return;
+  }
+
+  publicRoomsDirectory.innerHTML = "";
+  publicRoomsList.forEach((r) => {
+    const isMyRoom = currentRoom && currentRoom.room_id === r.room_id;
+    const card = document.createElement("div");
+    card.className = "public-room-card";
+    const watchingText = r.current_show_name
+      ? `📺 Watching: ${r.current_show_name}${r.current_ep_num ? ` — Ep ${r.current_ep_num}` : ""}`
+      : "🌐 Browsing catalogue";
+    const memberNames = (r.members || []).map((m) => m.username).join(", ");
+
+    card.innerHTML = `
+      <div>
+        <div style="display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap;">
+          <strong>${escapeHtml(r.name)}</strong>
+          <span class="room-code-pill">#${escapeHtml(r.room_id)}</span>
+          ${r.is_private ? `<span class="cached-badge" style="color: #fbbf24; border-color: #f59e0b;">🔒 Private</span>` : ""}
+        </div>
+        <div style="font-size: 0.8rem; color: var(--primary); margin-top: 2px;">
+          ${escapeHtml(watchingText)}
+        </div>
+        <div style="font-size: 0.76rem; color: var(--text-muted); margin-top: 2px;">
+          👥 ${r.member_count} in room: ${escapeHtml(memberNames || r.host_username)}
+        </div>
+      </div>
+      <div>
+        ${
+          isMyRoom
+            ? `<span class="cached-badge">Joined</span>`
+            : `<button type="button" class="mini-btn join-listed-room-btn">Join Room</button>`
+        }
+      </div>
+    `;
+
+    const joinBtn = card.querySelector(".join-listed-room-btn");
+    if (joinBtn) {
+      joinBtn.addEventListener("click", () => {
+        if (!currentUser) {
+          closeRoomsModal();
+          openAuthModal("login");
+          showToast("Please sign in to join a Watch Party Room.");
+          return;
+        }
+        let pw = "";
+        if (r.is_private) {
+          pw = window.prompt(`Enter password for room "${r.name}":`) || "";
+        }
+        socket.emit("join_room_event", {
+          room_id: r.room_id,
+          password: pw,
+          token: authToken,
+        });
+      });
+    }
+
+    publicRoomsDirectory.appendChild(card);
+  });
+}
+
+function openRoomsModal() {
+  if (!roomsModalBackdrop) return;
+  updateRoomsGuestBanner();
+  updateRoomUI();
+  fetchPublicRooms();
+  roomsModalBackdrop.classList.remove("hidden");
+}
+
+function closeRoomsModal() {
+  if (roomsModalBackdrop) roomsModalBackdrop.classList.add("hidden");
+}
+
+if (openRoomsModalBtn) {
+  openRoomsModalBtn.addEventListener("click", openRoomsModal);
+}
+if (closeRoomsModalBtn) {
+  closeRoomsModalBtn.addEventListener("click", closeRoomsModal);
+}
+if (roomsModalBackdrop) {
+  roomsModalBackdrop.addEventListener("click", (e) => {
+    if (e.target === roomsModalBackdrop) closeRoomsModal();
+  });
+}
+if (roomsSigninPromptBtn) {
+  roomsSigninPromptBtn.addEventListener("click", () => {
+    closeRoomsModal();
+    openAuthModal("login");
+  });
+}
+if (refreshRoomsBtn) {
+  refreshRoomsBtn.addEventListener("click", fetchPublicRooms);
+}
+if (copyRoomCodeBtn) {
+  copyRoomCodeBtn.addEventListener("click", () => {
+    if (currentRoom && currentRoom.room_id) {
+      navigator.clipboard?.writeText(currentRoom.room_id);
+      showToast(`Copied room code ${currentRoom.room_id} to clipboard!`);
+    }
+  });
+}
+if (leaveRoomBtn) {
+  leaveRoomBtn.addEventListener("click", () => {
+    if (socket && currentRoom) {
+      socket.emit("leave_room_event");
+    }
+  });
+}
+
+if (createRoomForm) {
+  createRoomForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (!currentUser) {
+      closeRoomsModal();
+      openAuthModal("login");
+      showToast("Please sign in to create a Watch Party Room.");
+      return;
+    }
+    const nameInput = document.getElementById("create-room-name-input");
+    const pwInput = document.getElementById("create-room-pw-input");
+    const name = (nameInput?.value || "").trim();
+    const password = (pwInput?.value || "").trim();
+
+    if (socket) {
+      socket.emit("create_room_event", {
+        name,
+        password,
+        token: authToken,
+        showId: currentShowId,
+        showName: currentShowName,
+        epNum: currentEpNum,
+      });
+    }
+    if (nameInput) nameInput.value = "";
+    if (pwInput) pwInput.value = "";
+  });
+}
+
+if (joinRoomCodeForm) {
+  joinRoomCodeForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (!currentUser) {
+      closeRoomsModal();
+      openAuthModal("login");
+      showToast("Please sign in to join a Watch Party Room.");
+      return;
+    }
+    const codeInput = document.getElementById("join-room-code-input");
+    const pwInput = document.getElementById("join-room-pw-input");
+    const room_id = (codeInput?.value || "").trim().toUpperCase();
+    const password = (pwInput?.value || "").trim();
+    if (!room_id) return;
+
+    if (socket) {
+      socket.emit("join_room_event", {
+        room_id,
+        password,
+        token: authToken,
+      });
+    }
+    if (codeInput) codeInput.value = "";
+    if (pwInput) pwInput.value = "";
+  });
+}
+
+if (socket) {
+  socket.on("room_joined", (data) => {
+    currentRoom = data.room;
+    isSyncEnabled = true;
+    if (syncToggle) syncToggle.checked = true;
+    updateRoomUI();
+    renderPublicRoomsDirectory();
+    showToast(`Joined room "${currentRoom.name}" (#${currentRoom.room_id})!`);
+  });
+
+  socket.on("room_updated", (data) => {
+    if (data && data.room) {
+      currentRoom = data.room;
+      updateRoomUI();
+    }
+    if (data && data.event) {
+      showToast(data.event);
+    }
+  });
+
+  socket.on("room_members_tick", (data) => {
+    if (data && data.room && currentRoom && data.room.room_id === currentRoom.room_id) {
+      currentRoom = data.room;
+      updateRoomUI();
+    }
+  });
+
+  socket.on("room_left", () => {
+    currentRoom = null;
+    updateRoomUI();
+    renderPublicRoomsDirectory();
+    showToast("You left the sync room.");
+  });
+
+  socket.on("room_kicked", (data) => {
+    currentRoom = null;
+    updateRoomUI();
+    renderPublicRoomsDirectory();
+    showToast((data && data.reason) || "Removed from room.");
+  });
+
+  socket.on("room_error", (data) => {
+    showToast((data && data.error) || "Room error.", 5000);
+  });
+
+  socket.on("rooms_list_updated", (data) => {
+    if (data && Array.isArray(data.rooms)) {
+      publicRoomsList = data.rooms;
+      renderPublicRoomsDirectory();
+    }
+  });
+
+  socket.on("admin_broadcast", (data) => {
+    if (data && data.message) {
+      showToast(`📢 Admin (${data.sender || "admin"}): ${data.message}`, 7000);
+    }
+  });
+}
+
+// ==========================================
+// 9. Admin Dashboard & Debug Suite
+// ==========================================
+const adminRefreshBtn = document.getElementById("admin-refresh-btn");
+const adminAutorefreshToggle = document.getElementById("admin-autorefresh-toggle");
+const adminCreateUserForm = document.getElementById("admin-create-user-form");
+const adminUsersTbody = document.getElementById("admin-users-tbody");
+const adminRoomsListEl = document.getElementById("admin-rooms-list");
+const adminClientsTbody = document.getElementById("admin-clients-tbody");
+const adminBroadcastForm = document.getElementById("admin-broadcast-form");
+const adminScraperTestForm = document.getElementById("admin-scraper-test-form");
+const adminScraperOutput = document.getElementById("admin-scraper-output");
+const adminSqlForm = document.getElementById("admin-sql-form");
+const adminSqlInput = document.getElementById("adm-sql-input");
+const adminSqlResultWrap = document.getElementById("admin-sql-result-wrap");
+const adminLogsBox = document.getElementById("admin-logs-box");
+const admClearLogsBtn = document.getElementById("adm-clear-logs-btn");
+
+const admProgModalBackdrop = document.getElementById("admin-user-progress-modal-backdrop");
+const closeAdmProgModalBtn = document.getElementById("close-adm-prog-modal-btn");
+const admProgModalTitle = document.getElementById("adm-prog-modal-title");
+const admProgModalSub = document.getElementById("adm-prog-modal-sub");
+const admProgJsonBox = document.getElementById("adm-prog-json-box");
+const admClearUserProgBtn = document.getElementById("adm-clear-user-prog-btn");
+let inspectedUserId = null;
+
+function formatDuration(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const remS = s % 60;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${remS}s`;
+  return `${m}m ${remS}s`;
+}
+
+function formatTimestamp(ts) {
+  if (!ts) return "Never";
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch (e) {
+    return "Never";
+  }
+}
+
+async function fetchAdminDashboardData() {
+  if (!currentUser || !currentUser.is_admin) return;
+  try {
+    const [ovRes, usRes] = await Promise.all([
+      fetch("/api/admin/overview", { headers: getAuthHeaders() }),
+      fetch("/api/admin/users", { headers: getAuthHeaders() }),
+    ]);
+    if (ovRes.ok) {
+      const ovData = await ovRes.json();
+      renderAdminOverview(ovData);
+    }
+    if (usRes.ok) {
+      const usData = await usRes.json();
+      renderAdminUsersTable(usData.users || []);
+    }
+  } catch (err) {
+    console.warn("Admin fetch error:", err);
+  }
+}
+
+function renderAdminOverview(data) {
+  const t = data.telemetry || {};
+  const setEl = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+
+  setEl("adm-stat-uptime", `Up ${formatDuration(t.uptime_seconds)}`);
+  setEl("adm-stat-host", `${t.hostname || "host"} • Python ${t.python_version || ""}`);
+
+  const tempStr = t.cpu_temp_c !== null && t.cpu_temp_c !== undefined ? ` • 🌡️ ${t.cpu_temp_c}°C` : "";
+  const loadStr = Array.isArray(t.load_avg) ? t.load_avg.join(" / ") : "0.0";
+  setEl("adm-stat-cpu", `Load: ${loadStr}${tempStr}`);
+  setEl("adm-stat-platform", `${t.cpu_count || 1} Cores • ${t.platform || ""}`);
+
+  const mem = t.memory || {};
+  setEl("adm-stat-ram", `${formatBytes(mem.used_bytes)} / ${formatBytes(mem.total_bytes)} (${mem.used_percent || 0}%)`);
+  setEl("adm-stat-ram-sub", `${formatBytes(mem.available_bytes)} RAM Available`);
+
+  const st = t.storage || {};
+  setEl("adm-stat-disk", `${formatBytes(st.free_bytes)} Free (${st.used_percent || 0}% Used)`);
+  setEl("adm-stat-disk-sub", `Offline Cache: ${formatBytes(st.cache_bytes)} (${st.cached_episodes_count || 0} eps)`);
+
+  const db = t.database || {};
+  const tbl = db.tables || {};
+  setEl("adm-stat-db", `${formatBytes(db.size_bytes)} SQLite3`);
+  setEl(
+    "adm-stat-db-sub",
+    `${tbl.users || 0} users • ${tbl.anime || 0} anime • ${tbl.user_sessions || 0} sessions`,
+  );
+
+  const roomsArr = data.rooms || [];
+  const clientsArr = data.clients || [];
+  setEl("adm-stat-live", `${clientsArr.length} Connected • ${roomsArr.length} Rooms`);
+  setEl(
+    "adm-stat-live-sub",
+    `Poster Cache: ${t.image_cache?.count || 0} files (${formatBytes(t.image_cache?.size_bytes || 0)}) • DNS Cache: ${t.proxy?.dns_cache_entries || 0}`,
+  );
+
+  // Render active rooms in Admin panel
+  const roomsBadge = document.getElementById("adm-rooms-count-badge");
+  if (roomsBadge) roomsBadge.textContent = `${roomsArr.length} Room${roomsArr.length === 1 ? "" : "s"}`;
+
+  if (adminRoomsListEl) {
+    if (roomsArr.length === 0) {
+      adminRoomsListEl.innerHTML = `<p style="color: var(--text-muted); font-size: 0.85rem;">No active sync rooms right now.</p>`;
+    } else {
+      adminRoomsListEl.innerHTML = "";
+      roomsArr.forEach((r) => {
+        const div = document.createElement("div");
+        div.className = "dl-job-card";
+        const membersHtml = (r.members || [])
+          .map(
+            (m) =>
+              `<span class="room-code-pill" style="margin-right: 4px; margin-top: 4px;">
+                ${escapeHtml(m.username)} (${escapeHtml(m.video_state)} ${formatTime(m.time || 0)})
+                <button type="button" class="mini-link-btn adm-kick-member-btn" data-room="${escapeHtml(r.room_id)}" data-sid="${escapeHtml(m.sid)}" style="margin-left: 4px; color: #f87171;" title="Kick from room">✕</button>
+              </span>`,
+          )
+          .join("");
+
+        div.innerHTML = `
+          <div class="dl-job-top">
+            <div>
+              <div class="dl-job-title">${escapeHtml(r.name)} <span class="room-code-pill">#${escapeHtml(r.room_id)}</span></div>
+              <div style="font-size: 0.76rem; color: var(--primary);">
+                Host: ${escapeHtml(r.host_username)} • ${escapeHtml(r.current_show_name || "Browsing")} ${r.current_ep_num ? `(Ep ${escapeHtml(r.current_ep_num)})` : ""}
+              </div>
+            </div>
+            <div style="display: flex; gap: 4px;">
+              <button type="button" class="mini-link-btn adm-join-room-btn" data-room="${escapeHtml(r.room_id)}">Join</button>
+              <button type="button" class="mini-link-btn adm-resync-room-btn" data-room="${escapeHtml(r.room_id)}">Resync</button>
+              <button type="button" class="mini-link-btn adm-close-room-btn" data-room="${escapeHtml(r.room_id)}" style="color: #f87171;">Close</button>
+            </div>
+          </div>
+          <div style="display: flex; flex-wrap: wrap;">${membersHtml}</div>
+        `;
+
+        div.querySelector(".adm-join-room-btn")?.addEventListener("click", () => {
+          socket?.emit("join_room_event", { room_id: r.room_id, token: authToken });
+        });
+        div.querySelector(".adm-resync-room-btn")?.addEventListener("click", async () => {
+          await fetch(`/api/admin/rooms/${encodeURIComponent(r.room_id)}/resync`, {
+            method: "POST",
+            headers: getAuthHeaders(),
+          });
+          showToast(`Triggered resync for room #${r.room_id}`);
+        });
+        div.querySelector(".adm-close-room-btn")?.addEventListener("click", async () => {
+          await fetch(`/api/admin/rooms/${encodeURIComponent(r.room_id)}/close`, {
+            method: "POST",
+            headers: getAuthHeaders(),
+          });
+          fetchAdminDashboardData();
+        });
+        div.querySelectorAll(".adm-kick-member-btn").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            await fetch(`/api/admin/rooms/${encodeURIComponent(btn.dataset.room)}/kick`, {
+              method: "POST",
+              headers: getAuthHeaders({ "Content-Type": "application/json" }),
+              body: JSON.stringify({ sid: btn.dataset.sid }),
+            });
+            fetchAdminDashboardData();
+          });
+        });
+
+        adminRoomsListEl.appendChild(div);
+      });
+    }
+  }
+
+  // Render connected socket clients
+  if (adminClientsTbody) {
+    adminClientsTbody.innerHTML = "";
+    if (clientsArr.length === 0) {
+      adminClientsTbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--text-muted);">No clients connected.</td></tr>`;
+    } else {
+      clientsArr.forEach((c) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><code>${escapeHtml((c.sid || "").slice(0, 8))}</code></td>
+          <td><strong>${escapeHtml(c.username || "Guest")}</strong> <span style="color:var(--text-muted);font-size:0.72rem;">(${escapeHtml(c.ip || "")})</span></td>
+          <td>${c.room_id ? `<span class="room-code-pill">#${escapeHtml(c.room_id)}</span>` : "-"}</td>
+          <td>${escapeHtml(c.status || "browsing")} (${escapeHtml(c.video_state || "paused")})</td>
+          <td>${escapeHtml(c.showName || c.showId || "-")} ${c.epNum ? `Ep ${escapeHtml(c.epNum)} (${formatTime(c.time || 0)})` : ""}</td>
+        `;
+        adminClientsTbody.appendChild(tr);
+      });
+    }
+  }
+
+  // Render logs
+  if (adminLogsBox) {
+    const logs = data.logs || [];
+    if (logs.length === 0) {
+      adminLogsBox.innerHTML = `<div style="color:var(--text-muted);">No server events logged yet.</div>`;
+    } else {
+      adminLogsBox.innerHTML = logs
+        .map(
+          (l) =>
+            `<div class="log-line ${escapeHtml(l.level)}">[${escapeHtml(l.iso)}] [${escapeHtml(l.level)}] [${escapeHtml(l.category)}] ${escapeHtml(l.message)}</div>`,
+        )
+        .join("");
+    }
+  }
+}
+
+function renderAdminUsersTable(users) {
+  const badge = document.getElementById("adm-users-count-badge");
+  if (badge) badge.textContent = `${users.length} User${users.length === 1 ? "" : "s"}`;
+  if (!adminUsersTbody) return;
+
+  adminUsersTbody.innerHTML = "";
+  users.forEach((u) => {
+    const tr = document.createElement("tr");
+    const onlineRooms = (u.online_clients || [])
+      .map((c) => (c.room_id ? `#${c.room_id}` : "Online"))
+      .join(", ");
+    const onlineHtml = u.is_online
+      ? `<span class="cached-badge">🟢 ${escapeHtml(onlineRooms || "Online")}</span>`
+      : `<span style="color:var(--text-muted);">Offline</span>`;
+
+    const isPrimaryAdmin = u.username.toLowerCase() === "admin";
+
+    tr.innerHTML = `
+      <td>${u.id}</td>
+      <td>
+        <strong>${escapeHtml(u.username)}</strong>
+        ${u.is_admin ? `<span class="admin-role-pill" style="margin-left:4px;">ADMIN</span>` : ""}
+      </td>
+      <td>${onlineHtml}</td>
+      <td>${u.watch_history_count} shows • ${u.saved_episodes_count} eps</td>
+      <td style="font-size:0.75rem;color:var(--text-muted);">${escapeHtml(formatTimestamp(u.last_login))}</td>
+      <td>
+        <div style="display:flex;gap:4px;flex-wrap:wrap;">
+          <button type="button" class="mini-link-btn adm-inspect-prog-btn" title="Inspect User Progress">🔍 Data</button>
+          <button type="button" class="mini-link-btn adm-reset-pw-btn" title="Reset Password">🔑 PW</button>
+          ${
+            !isPrimaryAdmin
+              ? `<button type="button" class="mini-link-btn adm-toggle-admin-btn" title="Toggle Admin Role">${u.is_admin ? "Demote" : "Make Admin"}</button>
+                 <button type="button" class="mini-link-btn adm-del-user-btn" style="color:#f87171;" title="Delete Account">🗑</button>`
+              : ""
+          }
+        </div>
+      </td>
+    `;
+
+    tr.querySelector(".adm-inspect-prog-btn")?.addEventListener("click", () => {
+      openAdminUserProgressModal(u.id);
+    });
+
+    tr.querySelector(".adm-reset-pw-btn")?.addEventListener("click", async () => {
+      const newPw = window.prompt(`Enter new password for "${u.username}":`);
+      if (!newPw) return;
+      const res = await fetch(`/api/admin/users/${u.id}`, {
+        method: "PUT",
+        headers: getAuthHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ password: newPw }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || "Failed to reset password.");
+      } else {
+        showToast(`Password updated for "${u.username}".`);
+      }
+    });
+
+    tr.querySelector(".adm-toggle-admin-btn")?.addEventListener("click", async () => {
+      const res = await fetch(`/api/admin/users/${u.id}`, {
+        method: "PUT",
+        headers: getAuthHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ is_admin: !u.is_admin }),
+      });
+      if (res.ok) {
+        showToast(`Updated role for "${u.username}".`);
+        fetchAdminDashboardData();
+      }
+    });
+
+    tr.querySelector(".adm-del-user-btn")?.addEventListener("click", async () => {
+      if (!window.confirm(`Delete account "${u.username}" and all their saved progress?`)) {
+        return;
+      }
+      const res = await fetch(`/api/admin/users/${u.id}`, {
+        method: "DELETE",
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        showToast(`Deleted user "${u.username}".`);
+        fetchAdminDashboardData();
+      }
+    });
+
+    adminUsersTbody.appendChild(tr);
+  });
+}
+
+async function openAdminUserProgressModal(userId) {
+  inspectedUserId = userId;
+  const res = await fetch(`/api/admin/users/${userId}/progress`, {
+    headers: getAuthHeaders(),
+  });
+  if (!res.ok) return;
+  const data = await res.json();
+  if (admProgModalTitle) {
+    admProgModalTitle.textContent = `🔍 Progress for "${data.user.username}" (ID #${data.user.id})`;
+  }
+  if (admProgModalSub) {
+    admProgModalSub.textContent = `Last updated: ${formatTimestamp(data.progress?.updatedAt)}`;
+  }
+  if (admProgJsonBox) {
+    admProgJsonBox.textContent = JSON.stringify(data.progress, null, 2);
+  }
+  if (admProgModalBackdrop) admProgModalBackdrop.classList.remove("hidden");
+}
+
+if (closeAdmProgModalBtn && admProgModalBackdrop) {
+  closeAdmProgModalBtn.addEventListener("click", () => {
+    admProgModalBackdrop.classList.add("hidden");
+  });
+}
+
+if (admClearUserProgBtn) {
+  admClearUserProgBtn.addEventListener("click", async () => {
+    if (!inspectedUserId) return;
+    if (!window.confirm("Are you sure you want to clear all saved progress for this user?")) return;
+    const res = await fetch(`/api/admin/users/${inspectedUserId}/progress/clear`, {
+      method: "POST",
+      headers: getAuthHeaders(),
+    });
+    if (res.ok) {
+      showToast("Cleared user's saved progress.");
+      openAdminUserProgressModal(inspectedUserId);
+      fetchAdminDashboardData();
+    }
+  });
+}
+
+if (adminRefreshBtn) {
+  adminRefreshBtn.addEventListener("click", fetchAdminDashboardData);
+}
+
+setInterval(() => {
+  if (
+    adminView &&
+    !adminView.classList.contains("hidden") &&
+    adminAutorefreshToggle?.checked &&
+    currentUser?.is_admin
+  ) {
+    fetchAdminDashboardData();
+  }
+}, 5000);
+
+if (adminCreateUserForm) {
+  adminCreateUserForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const uEl = document.getElementById("adm-new-username");
+    const pEl = document.getElementById("adm-new-password");
+    const aEl = document.getElementById("adm-new-is-admin");
+    const username = (uEl?.value || "").trim();
+    const password = pEl?.value || "";
+    const is_admin = Boolean(aEl?.checked);
+    if (!username || !password) return;
+
+    const res = await fetch("/api/admin/users", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ username, password, is_admin }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || "Failed to create account.");
+      return;
+    }
+    if (uEl) uEl.value = "";
+    if (pEl) pEl.value = "";
+    if (aEl) aEl.checked = false;
+    showToast(`Created account "${username}"!`);
+    fetchAdminDashboardData();
+  });
+}
+
+if (adminBroadcastForm) {
+  adminBroadcastForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const msgEl = document.getElementById("adm-broadcast-msg");
+    const roomEl = document.getElementById("adm-broadcast-room");
+    const message = (msgEl?.value || "").trim();
+    const room_id = (roomEl?.value || "").trim().toUpperCase();
+    if (!message) return;
+
+    const res = await fetch("/api/admin/rooms/broadcast", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ message, room_id }),
+    });
+    if (res.ok) {
+      if (msgEl) msgEl.value = "";
+      showToast("Broadcast sent!");
+      fetchAdminDashboardData();
+    }
+  });
+}
+
+document.querySelectorAll(".adm-maint-btn").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const action = btn.dataset.action;
+    if (action === "purge_all_images" && !window.confirm("Purge all cached poster images?")) {
+      return;
+    }
+    const res = await fetch("/api/admin/debug/maintenance", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ action }),
+    });
+    const data = await res.json();
+    showToast(data.message || data.error || "Action completed.");
+    fetchAdminDashboardData();
+  });
+});
+
+if (admClearLogsBtn) {
+  admClearLogsBtn.addEventListener("click", async () => {
+    await fetch("/api/admin/debug/maintenance", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ action: "clear_logs" }),
+    });
+    fetchAdminDashboardData();
+  });
+}
+
+if (adminScraperTestForm) {
+  adminScraperTestForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const action = document.getElementById("adm-scraper-action")?.value || "search";
+    const query = (document.getElementById("adm-scraper-query")?.value || "").trim();
+    const episode = (document.getElementById("adm-scraper-ep")?.value || "1").trim();
+    const mode = document.getElementById("adm-scraper-mode")?.value || "sub";
+    if (!query) return;
+
+    if (adminScraperOutput) {
+      adminScraperOutput.textContent = `Running '${action}' diagnostic for "${query}"...`;
+    }
+    const res = await fetch("/api/admin/debug/scraper", {
+      method: "POST",
+      headers: getAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ action, query, episode, mode }),
+    });
+    const data = await res.json();
+    if (adminScraperOutput) {
+      adminScraperOutput.textContent = JSON.stringify(data, null, 2);
+    }
+    fetchAdminDashboardData();
+  });
+}
+
+async function runAdminSqlQuery(queryStr) {
+  if (!queryStr || !adminSqlResultWrap) return;
+  const res = await fetch("/api/admin/debug/sql", {
+    method: "POST",
+    headers: getAuthHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ query: queryStr }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    adminSqlResultWrap.innerHTML = `<div style="padding:0.6rem;color:#f87171;">${escapeHtml(data.error || "SQL Error")}</div>`;
+    return;
+  }
+  const cols = data.columns || [];
+  const rows = data.rows || [];
+  if (cols.length === 0) {
+    adminSqlResultWrap.innerHTML = `<div style="padding:0.6rem;color:var(--text-muted);">No columns returned.</div>`;
+    return;
+  }
+  const thHtml = cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("");
+  const trHtml = rows
+    .map(
+      (r) =>
+        `<tr>${r.map((cell) => `<td>${escapeHtml(cell === null ? "NULL" : String(cell))}</td>`).join("")}</tr>`,
+    )
+    .join("");
+  adminSqlResultWrap.innerHTML = `
+    <table class="admin-table">
+      <thead><tr>${thHtml}</tr></thead>
+      <tbody>${trHtml || `<tr><td colspan="${cols.length}" style="text-align:center;color:var(--text-muted);">0 rows</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+document.querySelectorAll(".adm-sql-preset").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const q = btn.dataset.sql;
+    if (adminSqlInput) adminSqlInput.value = q;
+    runAdminSqlQuery(q);
+  });
+});
+
+if (adminSqlForm) {
+  adminSqlForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    runAdminSqlQuery(adminSqlInput?.value || "");
+  });
+}
+

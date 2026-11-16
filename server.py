@@ -1,18 +1,23 @@
 import base64
+import collections
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
+import functools
 import hashlib
 import html
 import ipaddress
 import json
 import os
+import platform
 import queue
 import re
+import secrets
 import shutil
 import socket
 import sqlite3
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,10 +25,29 @@ import urllib.parse
 import uuid
 import requests
 from flask import Flask, Response, jsonify, request, send_file
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+# In-memory ring buffer for Admin Dashboard live debug logs
+server_logs_lock = threading.Lock()
+server_logs = collections.deque(maxlen=250)
+
+
+def log_server_event(level, category, message):
+    entry = {
+        "timestamp": time.time(),
+        "iso": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "level": level.upper(),
+        "category": category,
+        "message": str(message),
+    }
+    with server_logs_lock:
+        server_logs.appendleft(entry)
+    print(f"[{entry['iso']}] [{entry['level']}] [{category}] {message}")
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "seasonal_cache.db")
@@ -680,6 +704,66 @@ def init_db():
                 UNIQUE(anime_name, episode_num, mode)
             )"""
         )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER DEFAULT 0,
+                created_at REAL NOT NULL,
+                last_login REAL
+            )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS user_progress (
+                user_id INTEGER PRIMARY KEY,
+                watch_history_json TEXT DEFAULT '[]',
+                episode_times_json TEXT DEFAULT '{}',
+                lang_prefs_json TEXT DEFAULT '{}',
+                season_trackers_json TEXT DEFAULT '{}',
+                settings_json TEXT DEFAULT '{}',
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )"""
+        )
+
+        # Ensure default admin account ('admin' / 'Juan(335753)') exists
+        now = time.time()
+        c.execute("SELECT id, password_hash, is_admin FROM users WHERE LOWER(username) = 'admin'")
+        admin_row = c.fetchone()
+        if not admin_row:
+            admin_pw_hash = generate_password_hash("Juan(335753)")
+            c.execute(
+                "INSERT INTO users (username, password_hash, is_admin, created_at, last_login) VALUES (?, ?, 1, ?, ?)",
+                ("admin", admin_pw_hash, now, None),
+            )
+            admin_id = c.lastrowid
+            c.execute(
+                "INSERT OR IGNORE INTO user_progress (user_id, updated_at) VALUES (?, ?)",
+                (admin_id, now),
+            )
+        else:
+            admin_id, existing_hash, existing_is_admin = admin_row
+            if not existing_is_admin or not check_password_hash(existing_hash, "Juan(335753)"):
+                c.execute(
+                    "UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?",
+                    (generate_password_hash("Juan(335753)"), admin_id),
+                )
+            c.execute(
+                "INSERT OR IGNORE INTO user_progress (user_id, updated_at) VALUES (?, ?)",
+                (admin_id, now),
+            )
 
         if os.path.exists(SQL_FILE_PATH):
             with open(SQL_FILE_PATH, "r", encoding="utf-8") as f:
@@ -3380,117 +3464,1002 @@ def get_seasonal():
 
 
 # ==========================================
-# Socket.IO Event Handlers & Sync Logic
+# Account System & User Progress Storage (SQLite3)
 # ==========================================
 
+SESSION_DURATION_SECONDS = 30 * 24 * 3600  # 30 days
+
+
+def _extract_auth_token(req_obj=None, explicit_token=None):
+    if explicit_token and isinstance(explicit_token, str) and explicit_token.strip():
+        return explicit_token.strip()
+    r = req_obj or request
+    auth_header = r.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    x_token = r.headers.get("X-Auth-Token", "")
+    if x_token.strip():
+        return x_token.strip()
+    cookie_token = r.cookies.get("syncwatch_token", "")
+    if cookie_token.strip():
+        return cookie_token.strip()
+    return None
+
+
+def get_user_by_token(token):
+    if not token:
+        return None
+    now = time.time()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """SELECT u.id, u.username, u.is_admin, u.created_at, u.last_login, s.expires_at
+               FROM user_sessions s
+               JOIN users u ON s.user_id = u.id
+               WHERE s.token = ?""",
+            (token,),
+        )
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return None
+        if row[5] < now:
+            c.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
+            conn.commit()
+            conn.close()
+            return None
+        conn.close()
+    return {
+        "id": row[0],
+        "username": row[1],
+        "is_admin": bool(row[2]),
+        "created_at": row[3],
+        "last_login": row[4],
+        "token": token,
+    }
+
+
+def get_current_user():
+    token = _extract_auth_token()
+    return get_user_by_token(token)
+
+
+def require_auth(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Authentication required"}), 401
+        request.current_user = user
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def require_admin(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Authentication required"}), 401
+        if not user.get("is_admin"):
+            return jsonify({"error": "Admin privileges required"}), 403
+        request.current_user = user
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _safe_json_loads(raw_str, default):
+    if not raw_str:
+        return default
+    try:
+        val = json.loads(raw_str)
+        return val if isinstance(val, type(default)) else default
+    except Exception:
+        return default
+
+
+def get_user_progress_from_db(user_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """SELECT watch_history_json, episode_times_json, lang_prefs_json,
+                      season_trackers_json, settings_json, updated_at
+               FROM user_progress
+               WHERE user_id = ?""",
+            (user_id,),
+        )
+        row = c.fetchone()
+        if not row:
+            now = time.time()
+            c.execute(
+                "INSERT OR IGNORE INTO user_progress (user_id, updated_at) VALUES (?, ?)",
+                (user_id, now),
+            )
+            conn.commit()
+            conn.close()
+            return {
+                "watchHistory": [],
+                "episodeTimes": {},
+                "langPrefs": {},
+                "seasonTrackers": {},
+                "settings": {},
+                "updatedAt": now,
+            }
+        conn.close()
+
+    return {
+        "watchHistory": _safe_json_loads(row[0], []),
+        "episodeTimes": _safe_json_loads(row[1], {}),
+        "langPrefs": _safe_json_loads(row[2], {}),
+        "seasonTrackers": _safe_json_loads(row[3], {}),
+        "settings": _safe_json_loads(row[4], {}),
+        "updatedAt": row[5] or 0.0,
+    }
+
+
+def save_or_merge_user_progress(user_id, payload, mode="merge"):
+    """
+    Saves or merges a user's progress in SQLite3.
+    Supports:
+      - mode="merge": merges client localStorage progress with existing account progress.
+      - mode="update" / "replace": updates provided keys, applies deletions/prefix clears.
+    """
+    if not isinstance(payload, dict):
+        return get_user_progress_from_db(user_id)
+
+    current = get_user_progress_from_db(user_id)
+    watch_history = list(current["watchHistory"])
+    episode_times = dict(current["episodeTimes"])
+    lang_prefs = dict(current["langPrefs"])
+    season_trackers = dict(current["seasonTrackers"])
+    settings = dict(current["settings"])
+
+    inc_history = payload.get("watchHistory")
+    inc_times = payload.get("episodeTimes")
+    inc_langs = payload.get("langPrefs")
+    inc_trackers = payload.get("seasonTrackers")
+    inc_settings = payload.get("settings")
+
+    if mode == "merge":
+        # 1. Merge watchHistory (preserve account items, add any missing local items, or if account was empty take local)
+        if isinstance(inc_history, list) and inc_history:
+            if not watch_history:
+                watch_history = [
+                    it
+                    for it in inc_history
+                    if isinstance(it, dict) and it.get("id") and it.get("id") not in ("undefined", "null")
+                ][:25]
+            else:
+                seen_ids = {str(it.get("id")) for it in watch_history if isinstance(it, dict) and it.get("id")}
+                seen_names = {str(it.get("name")) for it in watch_history if isinstance(it, dict) and it.get("name")}
+                for it in inc_history:
+                    if not isinstance(it, dict):
+                        continue
+                    iid = str(it.get("id") or "")
+                    iname = str(it.get("name") or "")
+                    if not iid or iid in ("undefined", "null"):
+                        continue
+                    if iid not in seen_ids and (not iname or iname not in seen_names):
+                        watch_history.append(it)
+                        seen_ids.add(iid)
+                        if iname:
+                            seen_names.add(iname)
+                watch_history = watch_history[:25]
+
+        # 2. Merge episodeTimes
+        if isinstance(inc_times, dict):
+            for k, v in inc_times.items():
+                if not str(k).startswith("save_"):
+                    continue
+                try:
+                    t_val = float(v)
+                except (ValueError, TypeError):
+                    continue
+                if t_val > 0:
+                    existing_t = float(episode_times.get(k, 0.0) or 0.0)
+                    if t_val > existing_t:
+                        episode_times[str(k)] = round(t_val, 2)
+
+        # 3. Merge langPrefs
+        if isinstance(inc_langs, dict):
+            for k, v in inc_langs.items():
+                if str(k).startswith("langPref_") and v in ("sub", "dub"):
+                    if str(k) not in lang_prefs:
+                        lang_prefs[str(k)] = v
+
+        # 4. Merge seasonTrackers
+        if isinstance(inc_trackers, dict):
+            for tk, tv in inc_trackers.items():
+                if str(tk).startswith("season_tracker_") and isinstance(tv, dict):
+                    existing_tr = season_trackers.get(str(tk))
+                    if not isinstance(existing_tr, dict):
+                        season_trackers[str(tk)] = tv
+                    else:
+                        merged_tr = dict(tv)
+                        merged_tr.update(existing_tr)
+                        season_trackers[str(tk)] = merged_tr
+
+        # 5. Merge settings
+        if isinstance(inc_settings, dict):
+            for sk, sv in inc_settings.items():
+                if sk not in settings:
+                    settings[sk] = sv
+    else:
+        # Direct update / delta mode
+        if isinstance(inc_history, list):
+            watch_history = [
+                it
+                for it in inc_history
+                if isinstance(it, dict) and it.get("id") and it.get("id") not in ("undefined", "null")
+            ][:25]
+
+        if isinstance(inc_times, dict):
+            if payload.get("replaceAllTimes"):
+                episode_times = {}
+            for k, v in inc_times.items():
+                if not str(k).startswith("save_"):
+                    continue
+                if v is None:
+                    episode_times.pop(str(k), None)
+                else:
+                    try:
+                        t_val = float(v)
+                        if t_val > 0:
+                            episode_times[str(k)] = round(t_val, 2)
+                        else:
+                            episode_times.pop(str(k), None)
+                    except (ValueError, TypeError):
+                        pass
+
+        deleted_times = payload.get("deletedEpisodeTimes")
+        if isinstance(deleted_times, list):
+            for dk in deleted_times:
+                episode_times.pop(str(dk), None)
+
+        clear_prefixes = payload.get("clearEpisodePrefixes")
+        if isinstance(clear_prefixes, list):
+            for pref in clear_prefixes:
+                pref_str = str(pref)
+                if pref_str:
+                    for k in list(episode_times.keys()):
+                        if k.startswith(pref_str):
+                            episode_times.pop(k, None)
+
+        if isinstance(inc_langs, dict):
+            for k, v in inc_langs.items():
+                if str(k).startswith("langPref_") and v in ("sub", "dub"):
+                    lang_prefs[str(k)] = v
+
+        if isinstance(inc_trackers, dict):
+            for tk, tv in inc_trackers.items():
+                if str(tk).startswith("season_tracker_") and isinstance(tv, dict):
+                    season_trackers[str(tk)] = tv
+
+        if isinstance(inc_settings, dict):
+            settings.update(inc_settings)
+
+    now = time.time()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO user_progress
+               (user_id, watch_history_json, episode_times_json, lang_prefs_json, season_trackers_json, settings_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   watch_history_json = excluded.watch_history_json,
+                   episode_times_json = excluded.episode_times_json,
+                   lang_prefs_json = excluded.lang_prefs_json,
+                   season_trackers_json = excluded.season_trackers_json,
+                   settings_json = excluded.settings_json,
+                   updated_at = excluded.updated_at""",
+            (
+                user_id,
+                json.dumps(watch_history),
+                json.dumps(episode_times),
+                json.dumps(lang_prefs),
+                json.dumps(season_trackers),
+                json.dumps(settings),
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    return {
+        "watchHistory": watch_history,
+        "episodeTimes": episode_times,
+        "langPrefs": lang_prefs,
+        "seasonTrackers": season_trackers,
+        "settings": settings,
+        "updatedAt": now,
+    }
+
+
+def _create_session_for_user(user_id):
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    expires_at = now + SESSION_DURATION_SECONDS
+    ip_addr = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ua = (request.headers.get("User-Agent") or "")[:250]
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO user_sessions (token, user_id, created_at, expires_at, ip_address, user_agent)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (token, user_id, now, expires_at, ip_addr, ua),
+        )
+        c.execute("UPDATE users SET last_login = ? WHERE id = ?", (now, user_id))
+        conn.commit()
+        conn.close()
+    return token
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def api_auth_register():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    local_progress = data.get("localProgress")
+
+    if not username or len(username) < 2 or len(username) > 32:
+        return jsonify({"error": "Username must be between 2 and 32 characters."}), 400
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", username):
+        return jsonify({"error": "Username may only contain letters, numbers, '_', '.', and '-'."}), 400
+    if not password or len(password) < 4:
+        return jsonify({"error": "Password must be at least 4 characters."}), 400
+
+    now = time.time()
+    pw_hash = generate_password_hash(password)
+
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,))
+        if c.fetchone():
+            conn.close()
+            return jsonify({"error": "Username is already taken."}), 409
+
+        c.execute(
+            "INSERT INTO users (username, password_hash, is_admin, created_at, last_login) VALUES (?, ?, 0, ?, ?)",
+            (username, pw_hash, now, now),
+        )
+        user_id = c.lastrowid
+        c.execute(
+            "INSERT INTO user_progress (user_id, updated_at) VALUES (?, ?)",
+            (user_id, now),
+        )
+        conn.commit()
+        conn.close()
+
+    token = _create_session_for_user(user_id)
+    if isinstance(local_progress, dict):
+        progress = save_or_merge_user_progress(user_id, local_progress, mode="merge")
+    else:
+        progress = get_user_progress_from_db(user_id)
+
+    log_server_event("INFO", "AUTH", f"New user registered: '{username}' (id={user_id})")
+
+    resp = jsonify(
+        {
+            "status": "success",
+            "token": token,
+            "user": {
+                "id": user_id,
+                "username": username,
+                "is_admin": False,
+                "created_at": now,
+            },
+            "progress": progress,
+        }
+    )
+    resp.set_cookie(
+        "syncwatch_token",
+        token,
+        max_age=SESSION_DURATION_SECONDS,
+        httponly=False,
+        samesite="Lax",
+    )
+    return resp
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    local_progress = data.get("localProgress")
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required."}), 400
+
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, username, password_hash, is_admin, created_at FROM users WHERE LOWER(username) = LOWER(?)",
+            (username,),
+        )
+        row = c.fetchone()
+        conn.close()
+
+    if not row or not check_password_hash(row[2], password):
+        log_server_event("WARN", "AUTH", f"Failed login attempt for username '{username}'")
+        return jsonify({"error": "Invalid username or password."}), 401
+
+    user_id, canonical_username, _, is_admin, created_at = row
+    token = _create_session_for_user(user_id)
+
+    if isinstance(local_progress, dict):
+        progress = save_or_merge_user_progress(user_id, local_progress, mode="merge")
+    else:
+        progress = get_user_progress_from_db(user_id)
+
+    log_server_event("INFO", "AUTH", f"User logged in: '{canonical_username}' (admin={bool(is_admin)})")
+
+    resp = jsonify(
+        {
+            "status": "success",
+            "token": token,
+            "user": {
+                "id": user_id,
+                "username": canonical_username,
+                "is_admin": bool(is_admin),
+                "created_at": created_at,
+            },
+            "progress": progress,
+        }
+    )
+    resp.set_cookie(
+        "syncwatch_token",
+        token,
+        max_age=SESSION_DURATION_SECONDS,
+        httponly=False,
+        samesite="Lax",
+    )
+    return resp
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_auth_logout():
+    token = _extract_auth_token()
+    if token:
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
+            conn.commit()
+            conn.close()
+    resp = jsonify({"status": "success"})
+    resp.delete_cookie("syncwatch_token")
+    return resp
+
+
+@app.route("/api/auth/me")
+def api_auth_me():
+    user = get_current_user()
+    if not user:
+        return jsonify({"authenticated": False, "user": None}), 200
+    progress = get_user_progress_from_db(user["id"])
+    return jsonify(
+        {
+            "authenticated": True,
+            "user": {
+                "id": user["id"],
+                "username": user["username"],
+                "is_admin": user["is_admin"],
+                "created_at": user["created_at"],
+            },
+            "progress": progress,
+        }
+    )
+
+
+@app.route("/api/account/password", methods=["POST"])
+@require_auth
+def api_change_password():
+    data = request.get_json(silent=True) or {}
+    current_pw = str(data.get("currentPassword") or "")
+    new_pw = str(data.get("newPassword") or "")
+    if len(new_pw) < 4:
+        return jsonify({"error": "New password must be at least 4 characters."}), 400
+
+    user_id = request.current_user["id"]
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        if not row or not check_password_hash(row[0], current_pw):
+            conn.close()
+            return jsonify({"error": "Current password is incorrect."}), 403
+        c.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (generate_password_hash(new_pw), user_id),
+        )
+        conn.commit()
+        conn.close()
+
+    log_server_event("INFO", "AUTH", f"User '{request.current_user['username']}' changed their password.")
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/account/progress", methods=["GET", "POST"])
+@require_auth
+def api_account_progress():
+    user_id = request.current_user["id"]
+    if request.method == "GET":
+        return jsonify({"status": "success", "progress": get_user_progress_from_db(user_id)})
+
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode") or "update").lower()
+    if mode not in ("merge", "update", "replace"):
+        mode = "update"
+    progress = save_or_merge_user_progress(user_id, data, mode=mode)
+    return jsonify({"status": "success", "progress": progress})
+
+
+# ==========================================
+# Room-Based Syncing Service & Socket.IO
+# ==========================================
+
+rooms_lock = threading.Lock()
+# Maps sid -> client dict
 clients = {}
-room_was_buffering = False
-sync_cooldown_until = 0.0
+# Maps room_id -> room dict
+rooms = {}
+# Maps sid -> room_id
+sid_to_room = {}
+
+
+def _generate_room_code():
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    for _ in range(50):
+        code = "".join(secrets.choice(alphabet) for _ in range(6))
+        if code not in rooms:
+            return code
+    return uuid.uuid4().hex[:6].upper()
+
+
+def _serialize_room(room, include_members_detail=True):
+    if not room:
+        return None
+    members_list = []
+    for m_sid, m_data in room["members"].items():
+        members_list.append(
+            {
+                "sid": m_sid,
+                "username": m_data.get("username") or "Guest",
+                "user_id": m_data.get("user_id"),
+                "is_host": m_sid == room.get("host_sid"),
+                "status": m_data.get("status", "browsing"),
+                "video_state": m_data.get("video_state", "paused"),
+                "time": round(float(m_data.get("time") or 0.0), 1),
+                "showId": m_data.get("showId"),
+                "showName": m_data.get("showName"),
+                "epNum": m_data.get("epNum"),
+            }
+        )
+    return {
+        "room_id": room["room_id"],
+        "name": room["name"],
+        "host_username": room["host_username"],
+        "host_sid": room["host_sid"],
+        "is_private": bool(room.get("password")),
+        "member_count": len(members_list),
+        "members": members_list if include_members_detail else [],
+        "current_show_id": room.get("current_show_id"),
+        "current_show_name": room.get("current_show_name"),
+        "current_ep_num": room.get("current_ep_num"),
+        "created_at": room.get("created_at"),
+    }
+
+
+def _get_public_rooms_list_locked():
+    out = []
+    for r in sorted(rooms.values(), key=lambda x: x.get("created_at", 0), reverse=True):
+        out.append(_serialize_room(r, include_members_detail=True))
+    return out
+
+
+def _broadcast_rooms_directory():
+    with rooms_lock:
+        public_list = _get_public_rooms_list_locked()
+    try:
+        socketio.emit("rooms_list_updated", {"rooms": public_list})
+    except Exception:
+        pass
+
+
+def _remove_sid_from_room(sid, notify=True):
+    room_to_notify = None
+    removed_username = "User"
+    with rooms_lock:
+        room_id = sid_to_room.pop(sid, None)
+        if sid in clients:
+            clients[sid]["room_id"] = None
+        if not room_id or room_id not in rooms:
+            return None
+        room = rooms[room_id]
+        member = room["members"].pop(sid, None)
+        if member:
+            removed_username = member.get("username") or "User"
+
+        try:
+            leave_room(room_id, sid=sid)
+        except Exception:
+            pass
+
+        if not room["members"]:
+            rooms.pop(room_id, None)
+            log_server_event("INFO", "ROOM", f"Room '{room['name']}' ({room_id}) closed (empty).")
+        else:
+            if room.get("host_sid") == sid:
+                next_sid, next_mem = next(iter(room["members"].items()))
+                room["host_sid"] = next_sid
+                room["host_username"] = next_mem.get("username") or "Host"
+            room_to_notify = _serialize_room(room)
+
+    if notify:
+        if room_to_notify:
+            try:
+                socketio.emit(
+                    "room_updated",
+                    {
+                        "room": room_to_notify,
+                        "event": f"{removed_username} left the room.",
+                    },
+                    to=room_id,
+                )
+            except Exception:
+                pass
+        _broadcast_rooms_directory()
+    return room_id
+
+
+@app.route("/api/rooms")
+def api_list_rooms():
+    with rooms_lock:
+        public_list = _get_public_rooms_list_locked()
+    return jsonify({"rooms": public_list})
 
 
 @socketio.on("connect")
 def handle_connect():
-    clients[request.sid] = {
-        "status": "browsing",
-        "video_state": "paused",
-        "time": 0.0,
-        "showId": None,
-        "epNum": None,
-    }
+    user = get_current_user()
+    ip_addr = request.headers.get("X-Forwarded-For", request.remote_addr)
+    with rooms_lock:
+        clients[request.sid] = {
+            "sid": request.sid,
+            "ip": ip_addr,
+            "connected_at": time.time(),
+            "user_id": user["id"] if user else None,
+            "username": user["username"] if user else "Guest",
+            "is_admin": user["is_admin"] if user else False,
+            "room_id": None,
+            "status": "browsing",
+            "video_state": "paused",
+            "time": 0.0,
+            "showId": None,
+            "showName": None,
+            "epNum": None,
+        }
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    clients.pop(request.sid, None)
+    _remove_sid_from_room(request.sid, notify=True)
+    with rooms_lock:
+        clients.pop(request.sid, None)
+
+
+@socketio.on("authenticate_socket")
+def handle_authenticate_socket(data):
+    data = data or {}
+    token = _extract_auth_token(explicit_token=data.get("token"))
+    user = get_user_by_token(token)
+    room_id_to_update = None
+    serialized = None
+    with rooms_lock:
+        c = clients.get(request.sid)
+        if c:
+            c["user_id"] = user["id"] if user else None
+            c["username"] = user["username"] if user else "Guest"
+            c["is_admin"] = user["is_admin"] if user else False
+            room_id = sid_to_room.get(request.sid)
+            if room_id and room_id in rooms:
+                room = rooms[room_id]
+                if request.sid in room["members"]:
+                    room["members"][request.sid]["username"] = c["username"]
+                    room["members"][request.sid]["user_id"] = c["user_id"]
+                if room.get("host_sid") == request.sid:
+                    room["host_username"] = c["username"]
+                room_id_to_update = room_id
+                serialized = _serialize_room(room)
+
+    if room_id_to_update and serialized:
+        socketio.emit("room_updated", {"room": serialized}, to=room_id_to_update)
+        _broadcast_rooms_directory()
+
+
+@socketio.on("create_room_event")
+def handle_create_room_event(data):
+    data = data or {}
+    token = _extract_auth_token(explicit_token=data.get("token"))
+    user = get_user_by_token(token)
+    if not user:
+        emit("room_error", {"error": "Please sign in to your account to create a sync room."})
+        return
+
+    room_name = str(data.get("name") or f"{user['username']}'s Watch Party").strip()[:50]
+    if not room_name:
+        room_name = f"{user['username']}'s Watch Party"
+    password = str(data.get("password") or "").strip()[:32]
+
+    # Leave any existing room first
+    _remove_sid_from_room(request.sid, notify=True)
+
+    with rooms_lock:
+        room_id = _generate_room_code()
+        c = clients.get(request.sid) or {}
+        c["user_id"] = user["id"]
+        c["username"] = user["username"]
+        c["is_admin"] = user["is_admin"]
+        c["room_id"] = room_id
+        clients[request.sid] = c
+
+        show_id = data.get("showId") or c.get("showId")
+        show_name = data.get("showName") or c.get("showName")
+        ep_num = data.get("epNum") or c.get("epNum")
+
+        member_obj = {
+            "sid": request.sid,
+            "username": user["username"],
+            "user_id": user["id"],
+            "status": c.get("status", "browsing"),
+            "video_state": c.get("video_state", "paused"),
+            "time": float(c.get("time") or 0.0),
+            "showId": show_id,
+            "showName": show_name,
+            "epNum": ep_num,
+            "joined_at": time.time(),
+        }
+
+        room = {
+            "room_id": room_id,
+            "name": room_name,
+            "host_username": user["username"],
+            "host_sid": request.sid,
+            "password": password,
+            "created_at": time.time(),
+            "room_was_buffering": False,
+            "sync_cooldown_until": 0.0,
+            "current_show_id": show_id,
+            "current_show_name": show_name,
+            "current_ep_num": ep_num,
+            "members": {request.sid: member_obj},
+        }
+        rooms[room_id] = room
+        sid_to_room[request.sid] = room_id
+        join_room(room_id)
+        serialized = _serialize_room(room)
+
+    log_server_event("INFO", "ROOM", f"User '{user['username']}' created room '{room_name}' ({room_id})")
+    emit("room_joined", {"room": serialized})
+    _broadcast_rooms_directory()
+
+
+@socketio.on("join_room_event")
+def handle_join_room_event(data):
+    data = data or {}
+    token = _extract_auth_token(explicit_token=data.get("token"))
+    user = get_user_by_token(token)
+    if not user:
+        emit("room_error", {"error": "Please sign in to your account to join a sync room."})
+        return
+
+    target_room_id = str(data.get("room_id") or "").strip().upper()
+    password = str(data.get("password") or "").strip()
+
+    if not target_room_id:
+        emit("room_error", {"error": "Room code is required."})
+        return
+
+    with rooms_lock:
+        target_room = rooms.get(target_room_id)
+        if not target_room:
+            emit("room_error", {"error": f"Room '{target_room_id}' was not found."})
+            return
+        if target_room.get("password") and target_room["password"] != password and not user.get("is_admin"):
+            emit("room_error", {"error": "Incorrect room password."})
+            return
+
+    # If in a different room, leave it first
+    current_room_id = sid_to_room.get(request.sid)
+    if current_room_id and current_room_id != target_room_id:
+        _remove_sid_from_room(request.sid, notify=True)
+
+    lead_to_sync = None
+    with rooms_lock:
+        room = rooms.get(target_room_id)
+        if not room:
+            emit("room_error", {"error": "Room no longer exists."})
+            return
+
+        c = clients.get(request.sid) or {}
+        c["user_id"] = user["id"]
+        c["username"] = user["username"]
+        c["is_admin"] = user["is_admin"]
+        c["room_id"] = target_room_id
+        clients[request.sid] = c
+
+        # Find if someone in the room is already watching a show so we can sync the joining member
+        for m_sid, m_data in room["members"].items():
+            if m_sid != request.sid and m_data.get("status") == "watching" and m_data.get("showId"):
+                lead_to_sync = {
+                    "showId": m_data["showId"],
+                    "showName": m_data.get("showName") or room.get("current_show_name") or m_data["showId"],
+                    "epNum": m_data.get("epNum") or 1,
+                    "time": float(m_data.get("time") or 0.0),
+                }
+                break
+
+        room["members"][request.sid] = {
+            "sid": request.sid,
+            "username": user["username"],
+            "user_id": user["id"],
+            "status": c.get("status", "browsing"),
+            "video_state": c.get("video_state", "paused"),
+            "time": float(c.get("time") or 0.0),
+            "showId": c.get("showId"),
+            "showName": c.get("showName"),
+            "epNum": c.get("epNum"),
+            "joined_at": time.time(),
+        }
+        sid_to_room[request.sid] = target_room_id
+        join_room(target_room_id)
+        serialized = _serialize_room(room)
+
+    log_server_event("INFO", "ROOM", f"User '{user['username']}' joined room '{serialized['name']}' ({target_room_id})")
+    emit("room_joined", {"room": serialized})
+    socketio.emit(
+        "room_updated",
+        {"room": serialized, "event": f"{user['username']} joined the room."},
+        to=target_room_id,
+    )
+    _broadcast_rooms_directory()
+
+    if lead_to_sync:
+        socketio.emit("force_load", lead_to_sync, to=request.sid)
+
+
+@socketio.on("leave_room_event")
+def handle_leave_room_event():
+    old_room_id = _remove_sid_from_room(request.sid, notify=True)
+    emit("room_left", {"room_id": old_room_id})
 
 
 @socketio.on("report_state")
 def handle_report_state(data):
-    if request.sid in clients:
-        clients[request.sid].update(data)
-    evaluate_room_sync()
-
-
-def evaluate_room_sync():
-    global room_was_buffering
-    global sync_cooldown_until
-
-    if not clients:
+    if not isinstance(data, dict):
         return
+    room_id = None
+    with rooms_lock:
+        if request.sid in clients:
+            clients[request.sid].update(data)
+        room_id = sid_to_room.get(request.sid)
+        if room_id and room_id in rooms:
+            room = rooms[room_id]
+            if request.sid in room["members"]:
+                room["members"][request.sid].update(data)
+                if data.get("showId"):
+                    room["current_show_id"] = data.get("showId")
+                if data.get("showName"):
+                    room["current_show_name"] = data.get("showName")
+                if data.get("epNum"):
+                    room["current_ep_num"] = data.get("epNum")
 
-    watching_clients = {
-        sid: data for sid, data in clients.items() if data.get("status") == "watching"
-    }
+    if room_id:
+        evaluate_room_sync(room_id)
 
-    if not watching_clients:
-        return
 
-    if len(watching_clients) < len(clients):
-        lead = list(watching_clients.values())[0]
-        for sid, data in clients.items():
-            if data.get("status") == "browsing":
-                socketio.emit(
-                    "force_load",
-                    {
-                        "showId": lead["showId"],
-                        "epNum": lead["epNum"],
-                        "time": lead["time"],
-                    },
-                    to=sid,
-                )
-        return
-
-    is_anyone_buffering = any(
-        c.get("video_state") == "buffering" for c in watching_clients.values()
-    )
-
-    if is_anyone_buffering:
-        room_was_buffering = True
-        for sid, c in watching_clients.items():
-            if c.get("video_state") == "playing":
-                socketio.emit("sync_correction", {"action": "pause_for_buffer"}, to=sid)
-        return
-
-    if room_was_buffering and not is_anyone_buffering:
-        room_was_buffering = False
-        socketio.emit("sync_correction", {"action": "all_ready_play"})
-        return
-
-    if time.time() < sync_cooldown_until:
-        return
-
-    playing_clients = [
-        sid for sid, c in watching_clients.items() if c.get("video_state") == "playing"
-    ]
-    paused_clients = [
-        sid for sid, c in watching_clients.items() if c.get("video_state") == "paused"
-    ]
-
-    if len(playing_clients) > 0 and len(paused_clients) > 0:
-        return
-
-    if len(watching_clients) > 1 and len(playing_clients) == len(watching_clients):
-        times = [(sid, c.get("time", 0.0)) for sid, c in watching_clients.items()]
-        times.sort(key=lambda x: x[1])
-
-        lowest_sid, lowest_time = times[0]
-        highest_sid, highest_time = times[-1]
-
-        time_diff = highest_time - lowest_time
-
-        if time_diff > 3.0:
-            socketio.emit(
-                "sync_correction",
-                {"action": "resync_time", "target_time": lowest_time},
-                to=highest_sid,
-            )
+def evaluate_room_sync(room_id):
+    with rooms_lock:
+        room = rooms.get(room_id)
+        if not room:
             return
+        members = dict(room["members"])
+        if len(members) < 2:
+            return
+
+        watching_clients = {
+            sid: data for sid, data in members.items() if data.get("status") == "watching" and data.get("showId")
+        }
+
+        if not watching_clients:
+            return
+
+        # Pull any room members still on the browse screen into the room's active episode
+        if len(watching_clients) < len(members):
+            lead = next(iter(watching_clients.values()))
+            lead_payload = {
+                "showId": lead["showId"],
+                "showName": lead.get("showName") or room.get("current_show_name") or lead["showId"],
+                "epNum": lead.get("epNum") or 1,
+                "time": lead.get("time", 0.0),
+            }
+            browsing_sids = [sid for sid, d in members.items() if d.get("status") == "browsing"]
+            for b_sid in browsing_sids:
+                socketio.emit("force_load", lead_payload, to=b_sid)
+            return
+
+        is_anyone_buffering = any(
+            c.get("video_state") == "buffering" for c in watching_clients.values()
+        )
+
+        if is_anyone_buffering:
+            room["room_was_buffering"] = True
+            for sid, c in watching_clients.items():
+                if c.get("video_state") == "playing":
+                    socketio.emit("sync_correction", {"action": "pause_for_buffer"}, to=sid)
+            return
+
+        if room.get("room_was_buffering") and not is_anyone_buffering:
+            room["room_was_buffering"] = False
+            socketio.emit("sync_correction", {"action": "all_ready_play"}, to=room_id)
+            return
+
+        if time.time() < room.get("sync_cooldown_until", 0.0):
+            return
+
+        playing_clients = [
+            sid for sid, c in watching_clients.items() if c.get("video_state") == "playing"
+        ]
+        paused_clients = [
+            sid for sid, c in watching_clients.items() if c.get("video_state") == "paused"
+        ]
+
+        if len(playing_clients) > 0 and len(paused_clients) > 0:
+            return
+
+        if len(watching_clients) > 1 and len(playing_clients) == len(watching_clients):
+            times = [(sid, float(c.get("time") or 0.0)) for sid, c in watching_clients.items()]
+            times.sort(key=lambda x: x[1])
+
+            lowest_sid, lowest_time = times[0]
+            highest_sid, highest_time = times[-1]
+
+            time_diff = highest_time - lowest_time
+
+            if time_diff > 3.0:
+                socketio.emit(
+                    "sync_correction",
+                    {"action": "resync_time", "target_time": lowest_time},
+                    to=highest_sid,
+                )
+                return
 
 
 def heartbeat_loop():
+    tick = 0
     while True:
         socketio.sleep(1)
+        tick += 1
         socketio.emit("request_heartbeat")
+        if tick % 2 == 0:
+            with rooms_lock:
+                room_snapshots = [(rid, _serialize_room(r)) for rid, r in rooms.items()]
+            for rid, snap in room_snapshots:
+                if snap:
+                    try:
+                        socketio.emit("room_members_tick", {"room": snap}, to=rid)
+                    except Exception:
+                        pass
 
 
 socketio.start_background_task(heartbeat_loop)
@@ -3498,51 +4467,695 @@ socketio.start_background_task(heartbeat_loop)
 
 @socketio.on("search_action")
 def handle_search_sync(data):
-    emit("receive_search", data, broadcast=True, include_self=False)
+    with rooms_lock:
+        room_id = sid_to_room.get(request.sid)
+    if room_id:
+        emit("receive_search", data, to=room_id, include_self=False)
 
 
 @socketio.on("load_show_action")
 def handle_load_show_sync(data):
-    global sync_cooldown_until
-    sync_cooldown_until = time.time() + 5.0
-    emit("receive_load_show", data, broadcast=True, include_self=False)
+    data = data or {}
+    with rooms_lock:
+        room_id = sid_to_room.get(request.sid)
+        if room_id and room_id in rooms:
+            room = rooms[room_id]
+            room["sync_cooldown_until"] = time.time() + 5.0
+            room["current_show_id"] = data.get("showId")
+            room["current_show_name"] = data.get("showName")
+            room["current_ep_num"] = data.get("targetEpNum")
+    if room_id:
+        emit("receive_load_show", data, to=room_id, include_self=False)
+        _broadcast_rooms_directory()
 
 
 @socketio.on("load_episode_action")
 def handle_load_episode_sync(data):
-    global sync_cooldown_until
-    sync_cooldown_until = time.time() + 5.0
-    emit("receive_load_episode", data, broadcast=True, include_self=False)
+    data = data or {}
+    with rooms_lock:
+        room_id = sid_to_room.get(request.sid)
+        if room_id and room_id in rooms:
+            room = rooms[room_id]
+            room["sync_cooldown_until"] = time.time() + 5.0
+            room["current_ep_num"] = data.get("epNum")
+    if room_id:
+        emit("receive_load_episode", data, to=room_id, include_self=False)
+        _broadcast_rooms_directory()
 
 
 @socketio.on("back_action")
 def handle_back_sync():
-    emit("receive_back", broadcast=True, include_self=False)
+    with rooms_lock:
+        room_id = sid_to_room.get(request.sid)
+    if room_id:
+        emit("receive_back", to=room_id, include_self=False)
 
 
 @socketio.on("play_action")
 def handle_play_sync(data):
-    global sync_cooldown_until
-    sync_cooldown_until = time.time() + 5.0
-    emit("receive_play", data, broadcast=True, include_self=False)
+    with rooms_lock:
+        room_id = sid_to_room.get(request.sid)
+        if room_id and room_id in rooms:
+            rooms[room_id]["sync_cooldown_until"] = time.time() + 5.0
+    if room_id:
+        emit("receive_play", data, to=room_id, include_self=False)
 
 
 @socketio.on("pause_action")
 def handle_pause_sync(data):
-    global sync_cooldown_until
-    sync_cooldown_until = time.time() + 5.0
-    emit("receive_pause", data, broadcast=True, include_self=False)
+    with rooms_lock:
+        room_id = sid_to_room.get(request.sid)
+        if room_id and room_id in rooms:
+            rooms[room_id]["sync_cooldown_until"] = time.time() + 5.0
+    if room_id:
+        emit("receive_pause", data, to=room_id, include_self=False)
 
 
 @socketio.on("seek_action")
 def handle_seek_sync(data):
-    global sync_cooldown_until
-    sync_cooldown_until = time.time() + 5.0
-    emit("receive_seek", data, broadcast=True, include_self=False)
+    with rooms_lock:
+        room_id = sid_to_room.get(request.sid)
+        if room_id and room_id in rooms:
+            rooms[room_id]["sync_cooldown_until"] = time.time() + 5.0
+    if room_id:
+        emit("receive_seek", data, to=room_id, include_self=False)
+
+
+# ==========================================
+# Admin Dashboard & Debug Endpoints
+# ==========================================
+
+
+def _get_system_telemetry():
+    uptime_seconds = max(0, int(time.time() - server_start_time))
+    load_avg = [0.0, 0.0, 0.0]
+    try:
+        load_avg = [round(x, 2) for x in os.getloadavg()]
+    except Exception:
+        pass
+
+    mem_total = 0
+    mem_avail = 0
+    try:
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem_total = int(line.split()[1]) * 1024
+                    elif line.startswith("MemAvailable:"):
+                        mem_avail = int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    mem_used = max(0, mem_total - mem_avail) if mem_total > 0 else 0
+    mem_pct = round((mem_used / mem_total) * 100, 1) if mem_total > 0 else 0.0
+
+    cpu_temp_c = None
+    try:
+        temp_path = "/sys/class/thermal/thermal_zone0/temp"
+        if os.path.exists(temp_path):
+            with open(temp_path, "r", encoding="utf-8") as tf:
+                cpu_temp_c = round(int(tf.read().strip()) / 1000.0, 1)
+    except Exception:
+        pass
+
+    db_size_bytes = 0
+    try:
+        if os.path.exists(DB_PATH):
+            db_size_bytes = os.path.getsize(DB_PATH)
+    except Exception:
+        pass
+
+    image_cache_count = 0
+    image_cache_bytes = 0
+    try:
+        if os.path.exists(IMAGE_CACHE_DIR):
+            for fname in os.listdir(IMAGE_CACHE_DIR):
+                fpath = os.path.join(IMAGE_CACHE_DIR, fname)
+                if os.path.isfile(fpath):
+                    image_cache_count += 1
+                    image_cache_bytes += os.path.getsize(fpath)
+    except Exception:
+        pass
+
+    table_counts = {}
+    seasonal_rows = []
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        for tbl in (
+            "users",
+            "user_sessions",
+            "user_progress",
+            "anime",
+            "anime_alt_names",
+            "anime_server_codes",
+            "seasonal_cache",
+            "cached_anime",
+            "cached_episodes",
+        ):
+            try:
+                c.execute(f"SELECT COUNT(*) FROM {tbl}")
+                table_counts[tbl] = c.fetchone()[0]
+            except Exception:
+                table_counts[tbl] = 0
+
+        try:
+            c.execute("SELECT year, season, data, last_updated FROM seasonal_cache ORDER BY year DESC, last_updated DESC")
+            for yr, seas, d_str, lu in c.fetchall():
+                items = _safe_json_loads(d_str, [])
+                seasonal_rows.append(
+                    {
+                        "year": yr,
+                        "season": seas,
+                        "anime_count": len(items),
+                        "last_updated": lu,
+                    }
+                )
+        except Exception:
+            pass
+        conn.close()
+
+    with proxy_security_lock:
+        dns_cache_size = len(_dns_validation_cache)
+        allowed_stream_hosts = sorted(ALLOWED_STREAM_HOSTS)
+        allowed_image_hosts = sorted(ALLOWED_IMAGE_HOSTS)
+
+    return {
+        "hostname": socket.gethostname(),
+        "platform": f"{platform.system()} {platform.release()} ({platform.machine()})",
+        "python_version": sys.version.split()[0],
+        "cpu_count": os.cpu_count() or 1,
+        "load_avg": load_avg,
+        "uptime_seconds": uptime_seconds,
+        "server_start_time": server_start_time,
+        "cpu_temp_c": cpu_temp_c,
+        "memory": {
+            "total_bytes": mem_total,
+            "used_bytes": mem_used,
+            "available_bytes": mem_avail,
+            "used_percent": mem_pct,
+        },
+        "storage": get_storage_status(),
+        "database": {
+            "path": DB_PATH,
+            "size_bytes": db_size_bytes,
+            "tables": table_counts,
+            "seasonal_cache": seasonal_rows,
+        },
+        "image_cache": {
+            "count": image_cache_count,
+            "size_bytes": image_cache_bytes,
+            "indexed_count": len(image_cache_index),
+        },
+        "proxy": {
+            "dns_cache_entries": dns_cache_size,
+            "allowed_stream_hosts": allowed_stream_hosts,
+            "allowed_image_hosts": allowed_image_hosts,
+        },
+    }
+
+
+@app.route("/api/admin/overview")
+@require_admin
+def api_admin_overview():
+    telemetry = _get_system_telemetry()
+    with rooms_lock:
+        active_rooms = _get_public_rooms_list_locked()
+        connected_clients = list(clients.values())
+    with download_lock:
+        dl_jobs = [
+            {k: v for k, v in j.items() if not k.startswith("_")}
+            for j in sorted(download_jobs.values(), key=lambda x: x["created_at"], reverse=True)
+        ]
+    with server_logs_lock:
+        logs_list = list(server_logs)
+
+    return jsonify(
+        {
+            "status": "success",
+            "telemetry": telemetry,
+            "rooms": active_rooms,
+            "clients": connected_clients,
+            "downloads": dl_jobs,
+            "logs": logs_list,
+        }
+    )
+
+
+@app.route("/api/admin/users", methods=["GET", "POST"])
+@require_admin
+def api_admin_users():
+    if request.method == "GET":
+        with rooms_lock:
+            online_by_uid = {}
+            for c in clients.values():
+                uid = c.get("user_id")
+                if uid:
+                    online_by_uid.setdefault(uid, []).append(
+                        {
+                            "sid": c.get("sid"),
+                            "room_id": c.get("room_id"),
+                            "status": c.get("status"),
+                            "showName": c.get("showName") or c.get("showId"),
+                            "epNum": c.get("epNum"),
+                        }
+                    )
+
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute(
+                """SELECT u.id, u.username, u.is_admin, u.created_at, u.last_login,
+                          p.watch_history_json, p.episode_times_json, p.lang_prefs_json, p.updated_at,
+                          (SELECT COUNT(*) FROM user_sessions s WHERE s.user_id = u.id AND s.expires_at > ?)
+                   FROM users u
+                   LEFT JOIN user_progress p ON u.id = p.user_id
+                   ORDER BY u.id ASC""",
+                (time.time(),),
+            )
+            rows = c.fetchall()
+            conn.close()
+
+        users_out = []
+        for r in rows:
+            uid = r[0]
+            wh = _safe_json_loads(r[5], [])
+            et = _safe_json_loads(r[6], {})
+            lp = _safe_json_loads(r[7], {})
+            online_sessions = online_by_uid.get(uid, [])
+            users_out.append(
+                {
+                    "id": uid,
+                    "username": r[1],
+                    "is_admin": bool(r[2]),
+                    "created_at": r[3],
+                    "last_login": r[4],
+                    "watch_history_count": len(wh),
+                    "saved_episodes_count": len(et),
+                    "lang_prefs_count": len(lp),
+                    "progress_updated_at": r[8],
+                    "active_sessions": r[9] or 0,
+                    "is_online": len(online_sessions) > 0,
+                    "online_clients": online_sessions,
+                }
+            )
+        return jsonify({"users": users_out})
+
+    # POST: Create user from Admin Dashboard
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    is_admin = 1 if data.get("is_admin") else 0
+
+    if not username or len(username) < 2 or len(username) > 32:
+        return jsonify({"error": "Username must be 2-32 characters."}), 400
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", username):
+        return jsonify({"error": "Username may only contain letters, numbers, '_', '.', and '-'."}), 400
+    if not password or len(password) < 4:
+        return jsonify({"error": "Password must be at least 4 characters."}), 400
+
+    now = time.time()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,))
+        if c.fetchone():
+            conn.close()
+            return jsonify({"error": "Username already exists."}), 409
+        c.execute(
+            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)",
+            (username, generate_password_hash(password), is_admin, now),
+        )
+        new_id = c.lastrowid
+        c.execute("INSERT INTO user_progress (user_id, updated_at) VALUES (?, ?)", (new_id, now))
+        conn.commit()
+        conn.close()
+
+    log_server_event(
+        "INFO",
+        "ADMIN",
+        f"Admin '{request.current_user['username']}' created account '{username}' (admin={bool(is_admin)})",
+    )
+    return jsonify({"status": "success", "user_id": new_id})
+
+
+@app.route("/api/admin/users/<int:user_id>", methods=["PUT", "DELETE"])
+@require_admin
+def api_admin_modify_user(user_id):
+    if request.method == "DELETE":
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+            row = c.fetchone()
+            if not row:
+                conn.close()
+                return jsonify({"error": "User not found"}), 404
+            if row[0].lower() == "admin":
+                conn.close()
+                return jsonify({"error": "Cannot delete the primary 'admin' account."}), 400
+            c.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM user_progress WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+            conn.close()
+
+        log_server_event(
+            "WARN",
+            "ADMIN",
+            f"Admin '{request.current_user['username']}' deleted account '{row[0]}' (id={user_id})",
+        )
+        return jsonify({"status": "success"})
+
+    # PUT: Update password or admin role
+    data = request.get_json(silent=True) or {}
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT username, is_admin FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "User not found"}), 404
+
+        target_username = row[0]
+        if "password" in data and data["password"]:
+            new_pw = str(data["password"])
+            if len(new_pw) < 4:
+                conn.close()
+                return jsonify({"error": "Password must be at least 4 characters."}), 400
+            c.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (generate_password_hash(new_pw), user_id),
+            )
+            log_server_event(
+                "INFO",
+                "ADMIN",
+                f"Admin '{request.current_user['username']}' reset password for '{target_username}'",
+            )
+
+        if "is_admin" in data:
+            new_admin_val = 1 if data["is_admin"] else 0
+            if target_username.lower() == "admin" and new_admin_val == 0:
+                conn.close()
+                return jsonify({"error": "Cannot remove admin role from primary 'admin' account."}), 400
+            c.execute("UPDATE users SET is_admin = ? WHERE id = ?", (new_admin_val, user_id))
+            log_server_event(
+                "INFO",
+                "ADMIN",
+                f"Admin '{request.current_user['username']}' set admin={bool(new_admin_val)} for '{target_username}'",
+            )
+
+        conn.commit()
+        conn.close()
+
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/admin/users/<int:user_id>/progress")
+@require_admin
+def api_admin_get_user_progress(user_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id, username, is_admin, created_at, last_login FROM users WHERE id = ?", (user_id,))
+        urow = c.fetchone()
+        conn.close()
+    if not urow:
+        return jsonify({"error": "User not found"}), 404
+    progress = get_user_progress_from_db(user_id)
+    return jsonify(
+        {
+            "user": {
+                "id": urow[0],
+                "username": urow[1],
+                "is_admin": bool(urow[2]),
+                "created_at": urow[3],
+                "last_login": urow[4],
+            },
+            "progress": progress,
+        }
+    )
+
+
+@app.route("/api/admin/users/<int:user_id>/progress/clear", methods=["POST"])
+@require_admin
+def api_admin_clear_user_progress(user_id):
+    now = time.time()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """UPDATE user_progress
+               SET watch_history_json = '[]',
+                   episode_times_json = '{}',
+                   lang_prefs_json = '{}',
+                   season_trackers_json = '{}',
+                   updated_at = ?
+               WHERE user_id = ?""",
+            (now, user_id),
+        )
+        conn.commit()
+        conn.close()
+    log_server_event("WARN", "ADMIN", f"Admin cleared progress for user_id={user_id}")
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/admin/users/<int:user_id>/sessions", methods=["DELETE"])
+@require_admin
+def api_admin_revoke_user_sessions(user_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+    log_server_event("INFO", "ADMIN", f"Admin revoked all sessions for user_id={user_id}")
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/admin/rooms/<room_id>/close", methods=["POST"])
+@require_admin
+def api_admin_close_room(room_id):
+    rid = room_id.strip().upper()
+    with rooms_lock:
+        room = rooms.pop(rid, None)
+        if not room:
+            return jsonify({"error": "Room not found"}), 404
+        member_sids = list(room["members"].keys())
+        for m_sid in member_sids:
+            sid_to_room.pop(m_sid, None)
+            if m_sid in clients:
+                clients[m_sid]["room_id"] = None
+            try:
+                leave_room(rid, sid=m_sid)
+            except Exception:
+                pass
+
+    for m_sid in member_sids:
+        socketio.emit(
+            "room_kicked",
+            {"reason": f"Room '{room['name']}' was closed by an Administrator."},
+            to=m_sid,
+        )
+    _broadcast_rooms_directory()
+    log_server_event("WARN", "ADMIN", f"Admin closed room '{room['name']}' ({rid})")
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/admin/rooms/<room_id>/kick", methods=["POST"])
+@require_admin
+def api_admin_kick_from_room(room_id):
+    data = request.get_json(silent=True) or {}
+    target_sid = data.get("sid")
+    if not target_sid:
+        return jsonify({"error": "Missing sid"}), 400
+    _remove_sid_from_room(target_sid, notify=True)
+    socketio.emit(
+        "room_kicked",
+        {"reason": "You were removed from the room by an Administrator."},
+        to=target_sid,
+    )
+    log_server_event("INFO", "ADMIN", f"Admin kicked sid={target_sid} from room {room_id}")
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/admin/rooms/<room_id>/resync", methods=["POST"])
+@require_admin
+def api_admin_resync_room(room_id):
+    rid = room_id.strip().upper()
+    with rooms_lock:
+        room = rooms.get(rid)
+        if not room:
+            return jsonify({"error": "Room not found"}), 404
+        room["sync_cooldown_until"] = 0.0
+    evaluate_room_sync(rid)
+    log_server_event("INFO", "ADMIN", f"Admin triggered force-resync on room {rid}")
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/admin/rooms/broadcast", methods=["POST"])
+@require_admin
+def api_admin_broadcast():
+    data = request.get_json(silent=True) or {}
+    message = str(data.get("message") or "").strip()
+    target_room = str(data.get("room_id") or "").strip().upper()
+    if not message:
+        return jsonify({"error": "Message cannot be empty"}), 400
+    payload = {
+        "message": message,
+        "sender": request.current_user["username"],
+        "timestamp": time.time(),
+    }
+    if target_room:
+        socketio.emit("admin_broadcast", payload, to=target_room)
+        log_server_event("INFO", "ADMIN", f"Broadcast to room {target_room}: {message}")
+    else:
+        socketio.emit("admin_broadcast", payload)
+        log_server_event("INFO", "ADMIN", f"Global broadcast: {message}")
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/admin/debug/scraper", methods=["POST"])
+@require_admin
+def api_admin_debug_scraper():
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "search").lower()
+    query = str(data.get("query") or "").strip()
+    episode = str(data.get("episode") or "1").strip()
+    mode = str(data.get("mode") or "sub").lower()
+
+    if not query:
+        return jsonify({"error": "Query / Anime name is required"}), 400
+
+    t0 = time.time()
+    try:
+        if action == "search":
+            res = search_anime(query, mode=mode)
+        elif action == "episodes":
+            res = get_episodes(query)
+        elif action == "stream":
+            res = get_stream_for_episode(query, episode, mode=mode)
+        elif action == "resolve_db":
+            res = resolve_anime_servers(query)
+        else:
+            return jsonify({"error": f"Unknown scraper action: {action}"}), 400
+        elapsed_ms = round((time.time() - t0) * 1000, 1)
+        log_server_event("INFO", "DEBUG", f"Scraper test '{action}' for '{query}' completed in {elapsed_ms}ms")
+        return jsonify({"status": "success", "elapsed_ms": elapsed_ms, "result": res})
+    except Exception as e:
+        elapsed_ms = round((time.time() - t0) * 1000, 1)
+        log_server_event("ERROR", "DEBUG", f"Scraper test '{action}' for '{query}' failed: {e}")
+        return jsonify({"status": "error", "elapsed_ms": elapsed_ms, "error": str(e)}), 500
+
+
+@app.route("/api/admin/debug/maintenance", methods=["POST"])
+@require_admin
+def api_admin_debug_maintenance():
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "").strip()
+
+    if action == "flush_dns_cache":
+        with proxy_security_lock:
+            count = len(_dns_validation_cache)
+            _dns_validation_cache.clear()
+        log_server_event("INFO", "DEBUG", f"Flushed {count} DNS validation cache entries.")
+        return jsonify({"status": "success", "message": f"Flushed {count} DNS cache entries."})
+
+    if action == "cleanup_expired_images":
+        cleanup_expired_images()
+        log_server_event("INFO", "DEBUG", "Ran expired image cache cleanup.")
+        return jsonify({"status": "success", "message": "Expired images cleaned up."})
+
+    if action == "purge_all_images":
+        removed = 0
+        with image_cache_lock:
+            image_cache_index.clear()
+            if os.path.exists(IMAGE_CACHE_DIR):
+                for fname in os.listdir(IMAGE_CACHE_DIR):
+                    fpath = os.path.join(IMAGE_CACHE_DIR, fname)
+                    if os.path.isfile(fpath):
+                        try:
+                            os.remove(fpath)
+                            removed += 1
+                        except Exception:
+                            pass
+        log_server_event("WARN", "DEBUG", f"Purged all {removed} cached poster images.")
+        return jsonify({"status": "success", "message": f"Purged {removed} cached poster images."})
+
+    if action == "vacuum_db":
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("VACUUM")
+            conn.close()
+        log_server_event("INFO", "DEBUG", "Executed SQLite VACUUM on database.")
+        return jsonify({"status": "success", "message": "Database VACUUM completed."})
+
+    if action == "export_sql_mappings":
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            sync_sql_file_locked(conn)
+            conn.close()
+        log_server_event("INFO", "DEBUG", "Exported anime mappings to anime_servers.sql.")
+        return jsonify({"status": "success", "message": "Synced anime_servers.sql to disk."})
+
+    if action == "clear_seasonal_cache":
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM seasonal_cache")
+            conn.commit()
+            conn.close()
+        log_server_event("WARN", "DEBUG", "Cleared seasonal_cache table.")
+        return jsonify({"status": "success", "message": "Cleared seasonal cache table."})
+
+    if action == "clear_logs":
+        with server_logs_lock:
+            server_logs.clear()
+        return jsonify({"status": "success", "message": "Server event logs cleared."})
+
+    if action == "allow_host":
+        host = _extract_clean_host(data.get("url") or f"https://{data.get('host', '')}")
+        if not host:
+            return jsonify({"error": "Invalid hostname"}), 400
+        with proxy_security_lock:
+            ALLOWED_STREAM_HOSTS.add(host)
+            ALLOWED_IMAGE_HOSTS.add(host)
+        log_server_event("INFO", "DEBUG", f"Added '{host}' to proxy host allowlists.")
+        return jsonify({"status": "success", "message": f"Added '{host}' to allowlists."})
+
+    return jsonify({"error": f"Unknown maintenance action: {action}"}), 400
+
+
+@app.route("/api/admin/debug/sql", methods=["POST"])
+@require_admin
+def api_admin_debug_sql():
+    data = request.get_json(silent=True) or {}
+    query = str(data.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "SQL query is required"}), 400
+
+    # Restrict to read-only SELECT / PRAGMA / EXPLAIN queries for safety
+    first_word = query.split()[0].upper() if query.split() else ""
+    if first_word not in ("SELECT", "PRAGMA", "EXPLAIN"):
+        return jsonify({"error": "Only SELECT, PRAGMA, and EXPLAIN queries are permitted in the SQL inspector."}), 400
+
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute(query)
+            rows = c.fetchmany(200)
+            columns = [desc[0] for desc in (c.description or [])]
+            conn.close()
+        return jsonify({"status": "success", "columns": columns, "rows": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
 
 # Initialize database and background threads for both Flask and Gunicorn
 init_db()
 init_image_cache_on_startup()
+log_server_event("INFO", "SYSTEM", "SyncStream server initialized and background workers started.")
 threading.Thread(target=update_current_season_loop, daemon=True).start()
 threading.Thread(target=image_cleanup_loop, daemon=True).start()
 threading.Thread(target=download_worker_loop, daemon=True).start()

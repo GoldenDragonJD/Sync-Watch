@@ -6,3 +6,4 @@ anime_servers.sql
 image_cache/
 anime_cache/
 __pycache__/
+.agents/

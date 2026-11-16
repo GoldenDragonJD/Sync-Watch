@@ -26,14 +26,38 @@
                     ⬇ Downloads
                     <span id="downloads-active-badge" class="nav-badge hidden">0</span>
                 </button>
+                <button type="button" id="nav-admin-btn" class="nav-tab-btn admin-nav-btn hidden">
+                    🛡️ Admin
+                </button>
             </nav>
 
-            <div class="sync-toggle-container">
-                <span class="sync-label">Watch Party Sync</span>
-                <label class="switch">
-                    <input type="checkbox" id="sync-toggle" />
-                    <span class="slider round"></span>
-                </label>
+            <div class="header-right-controls">
+                <div class="room-sync-pill" id="room-sync-pill">
+                    <button
+                        type="button"
+                        id="open-rooms-modal-btn"
+                        class="room-header-btn"
+                        title="Create or Join a Watch Party Room"
+                    >
+                        <span id="room-status-dot" class="room-dot offline"></span>
+                        <span id="room-header-label">🎬 Sync Rooms</span>
+                    </button>
+                    <label class="switch" title="Enable/Pause Room Sync">
+                        <input type="checkbox" id="sync-toggle" />
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+
+                <button
+                    type="button"
+                    id="header-account-btn"
+                    class="account-header-btn"
+                    title="Account & Progress Sync"
+                >
+                    <span id="header-account-icon">👤</span>
+                    <span id="header-account-label">Sign In</span>
+                    <span id="header-admin-badge" class="admin-role-pill hidden">ADMIN</span>
+                </button>
             </div>
         </header>
 
@@ -357,6 +381,261 @@
                     </div>
                 </div>
             </section>
+
+            <!-- ADMIN DASHBOARD WINDOW -->
+            <section id="admin-view" class="view hidden">
+                <div class="admin-dashboard-header">
+                    <div>
+                        <h2>🛡️ Server Admin &amp; Debug Dashboard</h2>
+                        <p style="color: var(--text-muted); font-size: 0.92rem">
+                            Monitor live Raspberry Pi / server telemetry, manage user accounts &amp; SQLite data, oversee sync rooms, and run diagnostics.
+                        </p>
+                    </div>
+                    <div class="admin-header-actions">
+                        <label class="autoplay-label" style="font-size: 0.85rem; font-weight: 600;">
+                            <input type="checkbox" id="admin-autorefresh-toggle" checked />
+                            Auto-Refresh (5s)
+                        </label>
+                        <button type="button" id="admin-refresh-btn" class="secondary-btn mini-btn">
+                            🔄 Refresh Now
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 1. Server Telemetry Overview Cards -->
+                <div class="admin-telemetry-grid" id="admin-telemetry-grid">
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-label">Server Host &amp; Uptime</div>
+                        <div class="admin-stat-value" id="adm-stat-uptime">--</div>
+                        <div class="admin-stat-sub" id="adm-stat-host">--</div>
+                    </div>
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-label">CPU Load &amp; Temp</div>
+                        <div class="admin-stat-value" id="adm-stat-cpu">--</div>
+                        <div class="admin-stat-sub" id="adm-stat-platform">--</div>
+                    </div>
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-label">Memory (RAM)</div>
+                        <div class="admin-stat-value" id="adm-stat-ram">--</div>
+                        <div class="admin-stat-sub" id="adm-stat-ram-sub">--</div>
+                    </div>
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-label">Disk &amp; Offline Cache</div>
+                        <div class="admin-stat-value" id="adm-stat-disk">--</div>
+                        <div class="admin-stat-sub" id="adm-stat-disk-sub">--</div>
+                    </div>
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-label">SQLite3 Database</div>
+                        <div class="admin-stat-value" id="adm-stat-db">--</div>
+                        <div class="admin-stat-sub" id="adm-stat-db-sub">--</div>
+                    </div>
+                    <div class="admin-stat-card">
+                        <div class="admin-stat-label">Live Connections &amp; Rooms</div>
+                        <div class="admin-stat-value" id="adm-stat-live">--</div>
+                        <div class="admin-stat-sub" id="adm-stat-live-sub">--</div>
+                    </div>
+                </div>
+
+                <!-- 2. Two-Column Layout: Account Management & Active Rooms -->
+                <div class="admin-panels-grid">
+                    <!-- Account Management Panel -->
+                    <div class="admin-panel">
+                        <div class="admin-panel-header">
+                            <h3>👥 User Accounts (SQLite3)</h3>
+                            <span id="adm-users-count-badge" class="cached-badge">0 Users</span>
+                        </div>
+
+                        <form id="admin-create-user-form" class="admin-inline-form">
+                            <input
+                                type="text"
+                                id="adm-new-username"
+                                placeholder="New username..."
+                                required
+                                autocomplete="off"
+                            />
+                            <input
+                                type="password"
+                                id="adm-new-password"
+                                placeholder="Password..."
+                                required
+                                autocomplete="new-password"
+                            />
+                            <label class="autoplay-label" style="font-size: 0.82rem; white-space: nowrap;">
+                                <input type="checkbox" id="adm-new-is-admin" />
+                                Admin
+                            </label>
+                            <button type="submit" class="mini-btn">➕ Create Account</button>
+                        </form>
+
+                        <div class="admin-table-wrap">
+                            <table class="admin-table">
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Username</th>
+                                        <th>Status / Room</th>
+                                        <th>Saved Progress</th>
+                                        <th>Last Login</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="admin-users-tbody">
+                                    <tr>
+                                        <td colspan="6" style="text-align: center; color: var(--text-muted);">Loading accounts...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Active Sync Rooms & Broadcast Panel -->
+                    <div class="admin-panel">
+                        <div class="admin-panel-header">
+                            <h3>🎬 Active Sync Rooms &amp; Clients</h3>
+                            <span id="adm-rooms-count-badge" class="cached-badge">0 Rooms</span>
+                        </div>
+
+                        <form id="admin-broadcast-form" class="admin-inline-form">
+                            <input
+                                type="text"
+                                id="adm-broadcast-msg"
+                                placeholder="Broadcast message to a room or all users..."
+                                required
+                            />
+                            <input
+                                type="text"
+                                id="adm-broadcast-room"
+                                placeholder="Room Code (blank = all)"
+                                style="max-width: 155px;"
+                            />
+                            <button type="submit" class="mini-btn">📢 Send</button>
+                        </form>
+
+                        <div id="admin-rooms-list" class="admin-rooms-list">
+                            <p style="color: var(--text-muted); font-size: 0.88rem;">No active rooms.</p>
+                        </div>
+
+                        <h4 style="margin: 1rem 0 0.5rem; font-size: 0.9rem; color: var(--text-muted);">
+                            Connected Socket Clients
+                        </h4>
+                        <div class="admin-table-wrap" style="max-height: 220px;">
+                            <table class="admin-table">
+                                <thead>
+                                    <tr>
+                                        <th>SID</th>
+                                        <th>User</th>
+                                        <th>Room</th>
+                                        <th>State</th>
+                                        <th>Watching</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="admin-clients-tbody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 3. Debug & Maintenance Tools Suite -->
+                <div class="admin-panels-grid" style="margin-top: 1.5rem;">
+                    <!-- Scraper & Maintenance Diagnostics -->
+                    <div class="admin-panel">
+                        <div class="admin-panel-header">
+                            <h3>🛠️ Server Maintenance &amp; Scraper Debugger</h3>
+                        </div>
+
+                        <div class="admin-maint-buttons">
+                            <button type="button" class="secondary-btn mini-btn adm-maint-btn" data-action="flush_dns_cache">
+                                🧹 Flush DNS Cache
+                            </button>
+                            <button type="button" class="secondary-btn mini-btn adm-maint-btn" data-action="cleanup_expired_images">
+                                🖼 Cleanup Expired Posters
+                            </button>
+                            <button type="button" class="secondary-btn mini-btn adm-maint-btn" data-action="purge_all_images">
+                                🗑 Purge All Posters
+                            </button>
+                            <button type="button" class="secondary-btn mini-btn adm-maint-btn" data-action="vacuum_db">
+                                🗜 SQLite VACUUM
+                            </button>
+                            <button type="button" class="secondary-btn mini-btn adm-maint-btn" data-action="export_sql_mappings">
+                                📄 Sync anime_servers.sql
+                            </button>
+                            <button type="button" class="secondary-btn mini-btn adm-maint-btn" data-action="clear_seasonal_cache">
+                                🔄 Clear Seasonal Cache
+                            </button>
+                        </div>
+
+                        <hr class="admin-divider" />
+
+                        <h4 style="margin-bottom: 0.6rem; font-size: 0.92rem;">🔬 Live Scraper &amp; Stream Diagnostic</h4>
+                        <form id="admin-scraper-test-form" class="admin-inline-form">
+                            <select id="adm-scraper-action" style="width: auto; min-width: 135px;">
+                                <option value="search">Search Anime</option>
+                                <option value="episodes">Fetch Episodes</option>
+                                <option value="stream">Extract Stream</option>
+                                <option value="resolve_db">Resolve SQL Mapping</option>
+                            </select>
+                            <input
+                                type="text"
+                                id="adm-scraper-query"
+                                placeholder="Anime title (e.g. Dr. Stone)..."
+                                required
+                            />
+                            <input
+                                type="text"
+                                id="adm-scraper-ep"
+                                placeholder="Ep #"
+                                value="1"
+                                style="max-width: 75px;"
+                            />
+                            <select id="adm-scraper-mode" style="width: auto; min-width: 75px;">
+                                <option value="sub">SUB</option>
+                                <option value="dub">DUB</option>
+                            </select>
+                            <button type="submit" class="mini-btn">▶ Run Test</button>
+                        </form>
+                        <pre id="admin-scraper-output" class="admin-code-box">Run a diagnostic above to inspect live scraper output and latency...</pre>
+                    </div>
+
+                    <!-- SQLite Inspector & Live Server Logs -->
+                    <div class="admin-panel">
+                        <div class="admin-panel-header">
+                            <h3>🗄️ SQLite3 Inspector &amp; Live Server Logs</h3>
+                            <button type="button" id="adm-clear-logs-btn" class="mini-link-btn">Clear Logs</button>
+                        </div>
+
+                        <div class="admin-sql-presets">
+                            <button type="button" class="mini-link-btn adm-sql-preset" data-sql="SELECT id, username, is_admin, datetime(created_at, 'unixepoch') AS created, datetime(last_login, 'unixepoch') AS last_login FROM users">
+                                Users Table
+                            </button>
+                            <button type="button" class="mini-link-btn adm-sql-preset" data-sql="SELECT user_id, substr(watch_history_json, 1, 120) AS history_preview, datetime(updated_at, 'unixepoch') AS updated FROM user_progress">
+                                User Progress
+                            </button>
+                            <button type="button" class="mini-link-btn adm-sql-preset" data-sql="SELECT anime_name, episode_num, mode, round(file_size/1048576.0, 1) AS size_mb FROM cached_episodes ORDER BY cached_at DESC LIMIT 30">
+                                Cached Episodes
+                            </button>
+                            <button type="button" class="mini-link-btn adm-sql-preset" data-sql="SELECT id, name, mal_id, sub_episodes, dub_episodes FROM anime ORDER BY id DESC LIMIT 30">
+                                Mapped Anime
+                            </button>
+                        </div>
+
+                        <form id="admin-sql-form" class="admin-inline-form" style="margin-top: 0.5rem;">
+                            <input
+                                type="text"
+                                id="adm-sql-input"
+                                placeholder="SELECT * FROM users LIMIT 20"
+                                value="SELECT id, username, is_admin, datetime(created_at, 'unixepoch') AS created FROM users"
+                            />
+                            <button type="submit" class="mini-btn">Run SQL</button>
+                        </form>
+                        <div id="admin-sql-result-wrap" class="admin-table-wrap" style="max-height: 185px; margin-bottom: 1rem;"></div>
+
+                        <h4 style="margin-bottom: 0.5rem; font-size: 0.9rem; color: var(--text-muted);">
+                            📋 Recent Server Event Logs
+                        </h4>
+                        <div id="admin-logs-box" class="admin-logs-box"></div>
+                    </div>
+                </div>
+            </section>
         </main>
 
         <!-- QUICK DOWNLOAD & CACHE MODAL (From Home Screen Hover or Card) -->
@@ -444,6 +723,249 @@
                 <p class="empty-dl-msg">No active downloads.</p>
             </div>
         </aside>
+
+        <!-- ACCOUNT / AUTHENTICATION MODAL -->
+        <div id="auth-modal-backdrop" class="modal-backdrop hidden">
+            <div class="download-modal" style="max-width: 480px;" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+                <div class="modal-header">
+                    <div>
+                        <h3 id="auth-modal-title">👤 Account &amp; Progress Sync</h3>
+                        <p id="auth-modal-subtitle" style="color: var(--text-muted); font-size: 0.85rem">
+                            Save your Continue Watching history, episode timestamps, and preferences to your account.
+                        </p>
+                    </div>
+                    <button type="button" id="close-auth-modal-btn" class="modal-close-btn" aria-label="Close">&times;</button>
+                </div>
+
+                <!-- Logged Out View (Sign In / Register) -->
+                <div id="auth-guest-section" class="modal-body">
+                    <div class="dl-target-switch">
+                        <button type="button" id="auth-tab-login-btn" class="dl-target-btn active">
+                            Sign In
+                        </button>
+                        <button type="button" id="auth-tab-register-btn" class="dl-target-btn">
+                            Create Account
+                        </button>
+                    </div>
+
+                    <form id="auth-form" class="auth-form">
+                        <div class="form-field">
+                            <label for="auth-username-input">Username</label>
+                            <input
+                                type="text"
+                                id="auth-username-input"
+                                placeholder="Enter your username..."
+                                required
+                                autocomplete="username"
+                            />
+                        </div>
+                        <div class="form-field">
+                            <label for="auth-password-input">Password</label>
+                            <input
+                                type="password"
+                                id="auth-password-input"
+                                placeholder="Enter your password..."
+                                required
+                                autocomplete="current-password"
+                            />
+                        </div>
+                        <p id="auth-error-msg" class="auth-error-msg hidden"></p>
+                        <div class="auth-migration-note">
+                            ✨ Any progress currently saved in this browser's local storage will be automatically imported to your account when you sign in or register!
+                        </div>
+                        <button type="submit" id="auth-submit-btn" style="width: 100%;">
+                            Sign In &amp; Sync Progress
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Logged In View (Profile & Account Actions) -->
+                <div id="auth-profile-section" class="modal-body hidden">
+                    <div class="profile-summary-card">
+                        <div class="profile-avatar">👤</div>
+                        <div style="flex: 1;">
+                            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                <h4 id="profile-username-display" style="font-size: 1.15rem;">Username</h4>
+                                <span id="profile-role-badge" class="cached-badge">MEMBER</span>
+                            </div>
+                            <p id="profile-progress-stats" style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem;">
+                                0 shows in history • 0 episode positions saved
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="profile-actions-stack">
+                        <button type="button" id="profile-sync-now-btn" class="secondary-btn" style="width: 100%;">
+                            ☁️ Sync &amp; Merge Browser Local Storage Now
+                        </button>
+                        <button type="button" id="profile-open-admin-btn" class="secondary-btn hidden" style="width: 100%; border-color: var(--primary); color: #a5b4fc;">
+                            🛡️ Open Admin Dashboard
+                        </button>
+                    </div>
+
+                    <hr class="admin-divider" />
+
+                    <form id="change-password-form" class="auth-form">
+                        <h4 style="font-size: 0.92rem; color: var(--text-muted);">🔑 Change Password</h4>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                            <input
+                                type="password"
+                                id="cp-current-pw"
+                                placeholder="Current password"
+                                required
+                            />
+                            <input
+                                type="password"
+                                id="cp-new-pw"
+                                placeholder="New password"
+                                required
+                            />
+                        </div>
+                        <button type="submit" class="secondary-btn mini-btn">Update Password</button>
+                    </form>
+
+                    <div class="modal-footer" style="padding: 0.75rem 0 0; background: transparent;">
+                        <button type="button" id="auth-logout-btn" class="secondary-btn" style="color: #f87171; border-color: rgba(239, 68, 68, 0.4); width: 100%;">
+                            🚪 Sign Out of Account
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- SYNC ROOMS MODAL (Room-Based Watch Party Sync) -->
+        <div id="rooms-modal-backdrop" class="modal-backdrop hidden">
+            <div class="download-modal" style="max-width: 680px;" role="dialog" aria-modal="true" aria-labelledby="rooms-modal-title">
+                <div class="modal-header">
+                    <div>
+                        <h3 id="rooms-modal-title">🎬 Watch Party Sync Rooms</h3>
+                        <p style="color: var(--text-muted); font-size: 0.85rem">
+                            Only people in the same room get synced together. Create a room or join your friends!
+                        </p>
+                    </div>
+                    <button type="button" id="close-rooms-modal-btn" class="modal-close-btn" aria-label="Close">&times;</button>
+                </div>
+
+                <div class="modal-body">
+                    <!-- Require Login Notice if Guest -->
+                    <div id="rooms-guest-warning" class="auth-migration-note hidden" style="display: flex; justify-content: space-between; align-items: center; gap: 1rem;">
+                        <span>🔒 Please sign in to your account to create or join a Watch Party Sync Room.</span>
+                        <button type="button" id="rooms-signin-prompt-btn" class="mini-btn" style="white-space: nowrap;">
+                            Sign In
+                        </button>
+                    </div>
+
+                    <!-- Active Room Banner (Shown when user is inside a room) -->
+                    <div id="active-room-panel" class="active-room-panel hidden">
+                        <div class="active-room-top">
+                            <div>
+                                <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                                    <span class="cached-badge">🟢 IN ROOM</span>
+                                    <h4 id="active-room-name" style="font-size: 1.1rem;">Room Name</h4>
+                                    <span class="room-code-pill">
+                                        Code: <strong id="active-room-code">------</strong>
+                                        <button type="button" id="copy-room-code-btn" class="mini-link-btn" style="margin-left: 4px;" title="Copy Room Code">📋 Copy</button>
+                                    </span>
+                                </div>
+                                <p id="active-room-watching-sub" style="color: var(--text-muted); font-size: 0.84rem; margin-top: 0.3rem;">
+                                    Host: --
+                                </p>
+                            </div>
+                            <button type="button" id="leave-room-btn" class="secondary-btn mini-btn" style="color: #f87171; border-color: rgba(239, 68, 68, 0.4);">
+                                🚪 Leave Room
+                            </button>
+                        </div>
+
+                        <div class="room-members-box">
+                            <div style="font-size: 0.78rem; color: var(--text-muted); text-transform: uppercase; font-weight: 700; margin-bottom: 0.4rem;">
+                                People Synced in This Room (<span id="active-room-member-count">1</span>)
+                            </div>
+                            <div id="active-room-members-list" class="room-members-list"></div>
+                        </div>
+                    </div>
+
+                    <!-- Create / Join Room Forms -->
+                    <div class="dl-option-cards">
+                        <form id="create-room-form" class="room-action-box">
+                            <h4>➕ Create a New Room</h4>
+                            <input
+                                type="text"
+                                id="create-room-name-input"
+                                placeholder="Room name (e.g. Friday Anime Night)..."
+                                maxlength="50"
+                            />
+                            <input
+                                type="password"
+                                id="create-room-pw-input"
+                                placeholder="Optional room password (leave blank for public)"
+                                maxlength="32"
+                            />
+                            <button type="submit" class="mini-btn" style="width: 100%;">
+                                Create &amp; Join Room
+                            </button>
+                        </form>
+
+                        <form id="join-room-code-form" class="room-action-box">
+                            <h4>🔑 Join by Room Code</h4>
+                            <input
+                                type="text"
+                                id="join-room-code-input"
+                                placeholder="Enter 6-character code (e.g. A7K9P2)..."
+                                maxlength="12"
+                                required
+                                style="text-transform: uppercase;"
+                            />
+                            <input
+                                type="password"
+                                id="join-room-pw-input"
+                                placeholder="Room password (if private)"
+                                maxlength="32"
+                            />
+                            <button type="submit" class="secondary-btn mini-btn" style="width: 100%; border-color: var(--primary);">
+                                Join Room by Code
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Public Rooms Directory -->
+                    <div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                            <h4 style="font-size: 0.95rem;">🌐 Active Rooms on Server</h4>
+                            <button type="button" id="refresh-rooms-btn" class="mini-link-btn">🔄 Refresh</button>
+                        </div>
+                        <div id="public-rooms-directory" class="public-rooms-directory">
+                            <p style="color: var(--text-muted); font-size: 0.88rem; text-align: center; padding: 1rem;">
+                                No active rooms right now. Create one above to start watching together!
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ADMIN USER PROGRESS INSPECTOR MODAL -->
+        <div id="admin-user-progress-modal-backdrop" class="modal-backdrop hidden">
+            <div class="download-modal" style="max-width: 650px;" role="dialog" aria-modal="true">
+                <div class="modal-header">
+                    <div>
+                        <h3 id="adm-prog-modal-title">🔍 User Progress Inspector</h3>
+                        <p id="adm-prog-modal-sub" style="color: var(--text-muted); font-size: 0.85rem"></p>
+                    </div>
+                    <button type="button" id="close-adm-prog-modal-btn" class="modal-close-btn">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <pre id="adm-prog-json-box" class="admin-code-box" style="max-height: 380px;"></pre>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" id="adm-clear-user-prog-btn" class="secondary-btn mini-btn" style="color: #f87171; border-color: rgba(239, 68, 68, 0.4);">
+                        🗑 Reset User's Saved Progress
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- TOAST NOTIFICATIONS -->
+        <div id="toast-container" class="toast-container"></div>
 
         <script src="/logic"></script>
     </body>
