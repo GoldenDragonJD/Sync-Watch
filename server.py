@@ -669,8 +669,9 @@ def normalize_name(name):
 
 def init_db():
     with db_lock:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL;")
         c.execute(
             """CREATE TABLE IF NOT EXISTS seasonal_cache
                (year INTEGER, season TEXT, data TEXT, last_updated REAL,
