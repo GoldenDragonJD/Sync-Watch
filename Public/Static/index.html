@@ -964,6 +964,51 @@
             </div>
         </div>
 
+        <!-- CLOUD VS LOCAL PROGRESS CONFLICT MODAL -->
+        <div id="progress-conflict-modal-backdrop" class="modal-backdrop hidden">
+            <div class="download-modal" style="max-width: 500px;" role="dialog" aria-modal="true" aria-labelledby="conflict-modal-title">
+                <div class="modal-header">
+                    <div>
+                        <h3 id="conflict-modal-title">⏱️ Progress Difference Detected</h3>
+                        <p id="conflict-modal-subtitle" style="color: var(--text-muted); font-size: 0.85rem">
+                            Your account has different playback progress saved from another device. Which state would you like to use?
+                        </p>
+                    </div>
+                </div>
+                <div class="modal-body">
+                    <div class="dl-option-cards">
+                        <div class="room-action-box" style="border-color: var(--border); justify-content: space-between;">
+                            <div>
+                                <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; font-weight: 700;">
+                                    📱 Local State (This Device)
+                                </div>
+                                <div id="conflict-local-details" style="font-size: 1.1rem; font-weight: 700; margin-top: 0.35rem; color: var(--text-main);">
+                                    Episode 1 • 00:00
+                                </div>
+                            </div>
+                            <button type="button" id="conflict-use-local-btn" class="secondary-btn mini-btn" style="width: 100%; margin-top: 0.75rem;">
+                                📱 Continue from Local State
+                            </button>
+                        </div>
+
+                        <div class="room-action-box" style="border-color: var(--primary); background-color: rgba(99, 102, 241, 0.1); justify-content: space-between;">
+                            <div>
+                                <div style="font-size: 0.75rem; color: #a5b4fc; text-transform: uppercase; font-weight: 700;">
+                                    ☁️ Cloud State (Account Save)
+                                </div>
+                                <div id="conflict-cloud-details" style="font-size: 1.1rem; font-weight: 700; margin-top: 0.35rem; color: var(--text-main);">
+                                    Episode 1 • 00:00
+                                </div>
+                            </div>
+                            <button type="button" id="conflict-use-cloud-btn" class="mini-btn" style="width: 100%; margin-top: 0.75rem;">
+                                ☁️ Sync to Cloud State
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- TOAST NOTIFICATIONS -->
         <div id="toast-container" class="toast-container"></div>
 

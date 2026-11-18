@@ -83,6 +83,23 @@ let currentRoom = null;
 let publicRoomsList = [];
 let lastEpisodeTimeSyncAt = 0;
 
+// Cross-Device Progress & Unpause Conflict State
+let isInitialSeekPending = false;
+let isProgrammaticPause = false;
+let lastUserPausedAt = 0;
+let isCheckingUnpauseConflict = false;
+let isBypassingUnpauseConflictCheck = false;
+const UNPAUSE_CLOUD_CHECK_COOLDOWN_MS = 30000; // Only check cloud on unpause if >= 30s have passed
+const CLOUD_TIME_DIFF_THRESHOLD_SEC = 10.0; // Prompt if cloud & local differ by > 10s
+const PROGRESS_UPLOAD_INTERVAL_MS = 5000; // Upload playback progress every 5s
+
+function pauseVideoProgrammatically() {
+  if (!videoPlayer.paused) {
+    isProgrammaticPause = true;
+    videoPlayer.pause();
+  }
+}
+
 // --- Sync Toggle State (Room-Based Sync) ---
 const syncToggle = document.getElementById("sync-toggle");
 let isSyncEnabled = false;
@@ -135,11 +152,11 @@ videoPlayer.addEventListener("pause", () => {
   clearTimeout(idleTimer);
 });
 
-// 1. Play & Pause
-function togglePlay() {
+// 1. Play & Pause (with 30-second unpause cloud conflict check)
+async function togglePlay() {
   if (videoPlayer.paused) {
     videoOverlay.classList.add("hidden");
-    videoPlayer.play();
+    await handleUserUnpauseRequest();
   } else {
     videoPlayer.pause();
   }
@@ -147,7 +164,7 @@ function togglePlay() {
 playPauseBtn.addEventListener("click", togglePlay);
 videoPlayer.addEventListener("click", togglePlay);
 
-// Native Video Events -> Sync Broadcasts
+// Native Video Events -> Sync Broadcasts & Progress Tracking
 videoPlayer.addEventListener("play", () => {
   playPauseBtn.textContent = "⏸";
   videoWrapper.classList.remove("paused");
@@ -155,8 +172,27 @@ videoPlayer.addEventListener("play", () => {
 
   if (isRemoteAction) {
     isRemoteAction = false;
+    lastUserPausedAt = 0;
     return;
   }
+
+  // If native/OS media keys triggered play directly after >= 30s pause, run the cloud check
+  if (
+    !isBypassingUnpauseConflictCheck &&
+    !isInitialSeekPending &&
+    !isCheckingUnpauseConflict &&
+    currentUser &&
+    authToken &&
+    !isRoomSyncActive() &&
+    lastUserPausedAt > 0 &&
+    Date.now() - lastUserPausedAt >= UNPAUSE_CLOUD_CHECK_COOLDOWN_MS
+  ) {
+    pauseVideoProgrammatically();
+    handleUserUnpauseRequest();
+    return;
+  }
+
+  lastUserPausedAt = 0;
 
   if (isRoomSyncActive()) {
     socket.emit("play_action", { time: videoPlayer.currentTime });
@@ -167,8 +203,28 @@ videoPlayer.addEventListener("pause", () => {
   playPauseBtn.textContent = "▶";
   videoWrapper.classList.add("paused");
 
-  if (currentShowId && currentEpNum && videoPlayer.currentTime > 0) {
-    flushEpisodeTimeToAccount(currentShowId, currentEpNum, videoPlayer.currentTime);
+  if (isProgrammaticPause) {
+    isProgrammaticPause = false;
+    return;
+  }
+
+  if (!isInitialSeekPending && !isCheckingUnpauseConflict) {
+    lastUserPausedAt = Date.now();
+    if (
+      currentShowId &&
+      currentEpNum &&
+      videoPlayer.currentTime > 0 &&
+      !videoPlayer.ended
+    ) {
+      const saveKey = `save_${currentShowId}_${currentEpNum}`;
+      localStorage.setItem(saveKey, videoPlayer.currentTime);
+      flushEpisodeTimeToAccount(
+        currentShowId,
+        currentShowName,
+        currentEpNum,
+        videoPlayer.currentTime,
+      );
+    }
   }
 
   if (isRemoteAction) {
@@ -182,6 +238,27 @@ videoPlayer.addEventListener("pause", () => {
 });
 
 videoPlayer.addEventListener("seeked", () => {
+  if (isInitialSeekPending) {
+    return;
+  }
+
+  if (
+    currentShowId &&
+    currentEpNum &&
+    videoPlayer.currentTime > 0 &&
+    !videoPlayer.ended
+  ) {
+    const saveKey = `save_${currentShowId}_${currentEpNum}`;
+    localStorage.setItem(saveKey, videoPlayer.currentTime);
+    lastEpisodeTimeSyncAt = Date.now();
+    flushEpisodeTimeToAccount(
+      currentShowId,
+      currentShowName,
+      currentEpNum,
+      videoPlayer.currentTime,
+    );
+  }
+
   if (isRemoteAction) {
     isRemoteAction = false;
     return;
@@ -315,7 +392,7 @@ window.addEventListener(
 // Loading overlay click
 videoOverlay.addEventListener("click", () => {
   videoOverlay.classList.add("hidden");
-  videoPlayer.play();
+  handleUserUnpauseRequest();
 });
 
 // =========================================
@@ -409,9 +486,7 @@ function playNextEpisode() {
     }, 2000);
 
     if (currentShowId && currentEpNum) {
-      const saveKey = `save_${currentShowId}_${currentEpNum}`;
-      localStorage.removeItem(saveKey);
-      syncAccountProgressDelta({ deletedEpisodeTimes: [saveKey] });
+      removeSavedEpisodeTime(currentShowId, currentShowName, currentEpNum);
     }
 
     const nextEp = currentEpisodeList[currentIndex + 1];
@@ -421,7 +496,7 @@ function playNextEpisode() {
       if (b.dataset.ep == nextEp || b.textContent == nextEp) b.classList.add("active");
     });
 
-    playVideo(nextEp);
+    playVideo(nextEp, false, true);
   }
 }
 
@@ -432,9 +507,7 @@ if (playerNextEpBtn) {
 
 videoPlayer.addEventListener("ended", () => {
   if (currentShowId && currentEpNum) {
-    const saveKey = `save_${currentShowId}_${currentEpNum}`;
-    localStorage.removeItem(saveKey);
-    syncAccountProgressDelta({ deletedEpisodeTimes: [saveKey] });
+    removeSavedEpisodeTime(currentShowId, currentShowName, currentEpNum);
   }
   if (isAutoplayEnabled) {
     playNextEpisode();
@@ -735,16 +808,7 @@ function renderSearchResults(shows) {
         return;
       }
 
-      let targetEp = 1;
-      const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
-      const savedShow = history.find(
-        (item) => item.name === show.name || item.id === id,
-      );
-      if (savedShow && savedShow.ep) {
-        targetEp = savedShow.ep;
-      }
-
-      loadEpisodes(id, show.name, targetEp, false, show.image || "");
+      loadEpisodes(id, show.name, null, false, show.image || "", false);
     });
 
     resultsGrid.appendChild(card);
@@ -754,9 +818,10 @@ function renderSearchResults(shows) {
 async function loadEpisodes(
   showId,
   showName,
-  targetEpNum = 1,
+  targetEpNum = null,
   isRemote = false,
   showImage = "",
+  explicitEpisode = false,
 ) {
   if (!showId || showId === "undefined" || showId === "null") {
     console.error("loadEpisodes called with invalid showId:", showId);
@@ -764,7 +829,47 @@ async function loadEpisodes(
     return;
   }
 
-  videoPlayer.pause();
+  // Flush previous episode progress if we were actively watching something else
+  if (
+    currentShowId &&
+    currentEpNum &&
+    !isInitialSeekPending &&
+    videoPlayer.currentTime > 0 &&
+    !videoPlayer.ended
+  ) {
+    const prevKey = `save_${currentShowId}_${currentEpNum}`;
+    localStorage.setItem(prevKey, videoPlayer.currentTime);
+    flushEpisodeTimeToAccount(
+      currentShowId,
+      currentShowName,
+      currentEpNum,
+      videoPlayer.currentTime,
+    );
+  }
+
+  isInitialSeekPending = true;
+  pauseVideoProgrammatically();
+
+  showTitleEl.textContent = showName;
+  updateWatchHeaderBadges(false);
+  showWatchView();
+  episodeGrid.innerHTML = "<p>Syncing account progress & loading episodes...</p>";
+
+  // 1. First fetch the latest saved progress from the user's cloud account before deciding episode/time
+  if (!isRemote && currentUser && authToken) {
+    await refreshProgressFromCloudIfLoggedIn();
+  }
+
+  // 2. Check saved watchHistory for this anime unless a specific episode was explicitly requested
+  if (!isRemote && (!explicitEpisode || targetEpNum === null || targetEpNum === undefined)) {
+    const savedShow = findSavedHistoryForShow(showId, showName);
+    if (savedShow && savedShow.ep) {
+      targetEpNum = savedShow.ep;
+    }
+  }
+  if (targetEpNum === null || targetEpNum === undefined || targetEpNum === "") {
+    targetEpNum = 1;
+  }
 
   if (!isRemote && isRoomSyncActive()) {
     socket.emit("load_show_action", { showId, showName, targetEpNum });
@@ -778,19 +883,15 @@ async function loadEpisodes(
   // Exit selection mode when switching shows
   exitPlayerEpisodeSelectionMode();
 
-  const savedMode = localStorage.getItem(`langPref_${showId}`);
+  const savedMode =
+    localStorage.getItem(`langPref_${showId}`) ||
+    (showName ? localStorage.getItem(`langPref_${showName}`) : null);
   if (savedMode && (savedMode === "sub" || savedMode === "dub")) {
     modeToggle.value = savedMode;
   }
 
   updateWatchHistory(showId, showName, targetEpNum);
-
-  showTitleEl.textContent = showName;
-  updateWatchHeaderBadges(false);
-  showWatchView();
   updateURL(showId, showName, targetEpNum);
-
-  episodeGrid.innerHTML = "<p>Loading episodes...</p>";
 
   try {
     const res = await fetch(`/api/${encodeURIComponent(showId)}/episodes`);
@@ -821,9 +922,9 @@ async function loadEpisodes(
       currentEpisodeList.includes(targetEpNum.toString()) ||
       currentEpisodeList.includes(Number(targetEpNum))
     ) {
-      playVideo(targetEpNum, isRemote);
+      playVideo(targetEpNum, isRemote, true);
     } else if (currentEpisodeList.length > 0) {
-      playVideo(currentEpisodeList[0], isRemote);
+      playVideo(currentEpisodeList[0], isRemote, true);
     }
   } catch (err) {
     console.error(err);
@@ -887,7 +988,7 @@ function renderEpisodeButtons(episodes, activeEpNum) {
         .querySelectorAll("#episode-grid .ep-btn")
         .forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
-      playVideo(epStr);
+      playVideo(epStr, false, false);
     });
 
     episodeGrid.appendChild(btn);
@@ -905,10 +1006,30 @@ function updateWatchHeaderBadges(isPlayingCachedStream = false) {
   }
 }
 
-async function playVideo(epNum, isRemote = false) {
+async function playVideo(epNum, isRemote = false, skipCloudFetch = false) {
   if (!currentShowId) return;
 
-  videoPlayer.pause();
+  // Flush previous episode time if switching episodes while actively watching
+  if (
+    currentEpNum &&
+    String(currentEpNum) !== String(epNum) &&
+    !isInitialSeekPending &&
+    videoPlayer.currentTime > 0 &&
+    !videoPlayer.ended
+  ) {
+    const prevKey = `save_${currentShowId}_${currentEpNum}`;
+    localStorage.setItem(prevKey, videoPlayer.currentTime);
+    flushEpisodeTimeToAccount(
+      currentShowId,
+      currentShowName,
+      currentEpNum,
+      videoPlayer.currentTime,
+    );
+  }
+
+  isInitialSeekPending = true;
+  lastUserPausedAt = 0;
+  pauseVideoProgrammatically();
 
   currentStreamFetchId++;
   const fetchId = currentStreamFetchId;
@@ -942,6 +1063,11 @@ async function playVideo(epNum, isRemote = false) {
   videoOverlay.innerHTML = "Loading Stream...";
 
   try {
+    // If playVideo was called directly (e.g. clicking an episode button), refresh cloud progress first
+    if (!skipCloudFetch && !isRemote && currentUser && authToken) {
+      await refreshProgressFromCloudIfLoggedIn();
+    }
+
     const mode = modeToggle.value;
     const res = await fetch(
       `/api/stream/${encodeURIComponent(currentShowId)}/${encodeURIComponent(epNum)}?mode=${mode}`,
@@ -1024,34 +1150,43 @@ async function playVideo(epNum, isRemote = false) {
       videoPlayer.appendChild(track);
     }
 
+    // Look up the saved timestamp from account / localStorage BEFORE starting playback
+    const targetSavedTime = getSavedEpisodeTime(currentShowId, currentShowName, epNum);
+
+    const startPlaybackAfterSeek = () => {
+      // Now that we have sought to the saved moment, allow progress time uploads!
+      isInitialSeekPending = false;
+      lastEpisodeTimeSyncAt = Date.now();
+      lastUserPausedAt = 0;
+
+      if (isRoomSyncActive() && currentRoom && currentRoom.member_count > 1) {
+        pauseVideoProgrammatically();
+        videoOverlay.innerHTML = "Waiting for room members to buffer...";
+        videoOverlay.classList.remove("hidden");
+      } else {
+        isBypassingUnpauseConflictCheck = true;
+        videoPlayer
+          .play()
+          .then(() => {
+            isBypassingUnpauseConflictCheck = false;
+            videoOverlay.classList.add("hidden");
+          })
+          .catch((error) => {
+            isBypassingUnpauseConflictCheck = false;
+            console.warn("Autoplay blocked by browser:", error);
+            videoOverlay.innerHTML =
+              "Browser Blocked Autoplay.<br><br><b>Click Here to Play</b>";
+            videoOverlay.classList.remove("hidden");
+            videoWrapper.classList.add("paused");
+          });
+      }
+    };
+
     const resumePlayback = () => {
+      if (fetchId !== currentStreamFetchId) return;
+
       if (videoPlayer.textTracks && videoPlayer.textTracks.length > 0) {
         videoPlayer.textTracks[0].mode = data.sub_url ? "showing" : "disabled";
-      }
-
-      const savedTime = localStorage.getItem(`save_${currentShowId}_${epNum}`);
-      if (savedTime) {
-        const parsedTime = parseFloat(savedTime);
-        const applySavedTime = () => {
-          if (
-            videoPlayer.duration &&
-            parsedTime >= videoPlayer.duration - 60
-          ) {
-            localStorage.removeItem(`save_${currentShowId}_${epNum}`);
-            videoPlayer.currentTime = 0;
-          } else {
-            videoPlayer.currentTime = parsedTime;
-          }
-        };
-        if (videoPlayer.duration) {
-          applySavedTime();
-        } else {
-          videoPlayer.addEventListener("loadedmetadata", applySavedTime, {
-            once: true,
-          });
-        }
-      } else {
-        videoPlayer.currentTime = 0;
       }
 
       if ("mediaSession" in navigator) {
@@ -1062,23 +1197,43 @@ async function playVideo(epNum, isRemote = false) {
         });
       }
 
-      if (isRoomSyncActive() && currentRoom && currentRoom.member_count > 1) {
-        videoPlayer.pause();
-        videoOverlay.innerHTML = "Waiting for room members to buffer...";
-        videoOverlay.classList.remove("hidden");
-      } else {
-        videoPlayer
-          .play()
-          .then(() => {
-            videoOverlay.classList.add("hidden");
-          })
-          .catch((error) => {
-            console.warn("Autoplay blocked by browser:", error);
-            videoOverlay.innerHTML =
-              "Browser Blocked Autoplay.<br><br><b>Click Here to Play</b>";
-            videoOverlay.classList.remove("hidden");
-            videoWrapper.classList.add("paused");
+      if (targetSavedTime > 0) {
+        const applySavedTimeAndStart = () => {
+          if (fetchId !== currentStreamFetchId) return;
+          if (
+            videoPlayer.duration &&
+            targetSavedTime >= videoPlayer.duration - 60
+          ) {
+            removeSavedEpisodeTime(currentShowId, currentShowName, epNum);
+            videoPlayer.currentTime = 0;
+            startPlaybackAfterSeek();
+          } else {
+            const onInitialSeekDone = () => {
+              videoPlayer.removeEventListener("seeked", onInitialSeekDone);
+              startPlaybackAfterSeek();
+            };
+            videoPlayer.addEventListener("seeked", onInitialSeekDone, { once: true });
+            videoPlayer.currentTime = targetSavedTime;
+            // Fallback in case browser is already at targetSavedTime (e.g. via HLS startPosition)
+            setTimeout(() => {
+              if (fetchId === currentStreamFetchId && isInitialSeekPending) {
+                videoPlayer.removeEventListener("seeked", onInitialSeekDone);
+                startPlaybackAfterSeek();
+              }
+            }, 350);
+          }
+        };
+
+        if (videoPlayer.readyState >= 1 && videoPlayer.duration) {
+          applySavedTimeAndStart();
+        } else {
+          videoPlayer.addEventListener("loadedmetadata", applySavedTimeAndStart, {
+            once: true,
           });
+        }
+      } else {
+        videoPlayer.currentTime = 0;
+        startPlaybackAfterSeek();
       }
     };
 
@@ -1092,6 +1247,7 @@ async function playVideo(epNum, isRemote = false) {
         capLevelToPlayerSize: false,
         startLevel: -1,
         maxBufferLength: 30,
+        startPosition: targetSavedTime > 0 ? targetSavedTime : -1,
       });
       currentHlsInstance.loadSource(proxyUrl);
       currentHlsInstance.attachMedia(videoPlayer);
@@ -1115,13 +1271,32 @@ async function playVideo(epNum, isRemote = false) {
     }
   } catch (err) {
     console.error(err);
+    isInitialSeekPending = false;
     videoOverlay.innerHTML = "Failed to load stream.";
     videoOverlay.classList.remove("hidden");
   }
 }
 
 function stopPlayerMedia() {
-  videoPlayer.pause();
+  if (
+    currentShowId &&
+    currentEpNum &&
+    !isInitialSeekPending &&
+    videoPlayer.currentTime > 0 &&
+    !videoPlayer.ended
+  ) {
+    const saveKey = `save_${currentShowId}_${currentEpNum}`;
+    localStorage.setItem(saveKey, videoPlayer.currentTime);
+    flushEpisodeTimeToAccount(
+      currentShowId,
+      currentShowName,
+      currentEpNum,
+      videoPlayer.currentTime,
+    );
+  }
+  isInitialSeekPending = false;
+  lastUserPausedAt = 0;
+  pauseVideoProgrammatically();
   videoPlayer.removeAttribute("src");
   if (currentHlsInstance) {
     currentHlsInstance.destroy();
@@ -1145,6 +1320,9 @@ function showSearchView() {
   searchInput.value = "";
 
   renderContinueWatching();
+  if (currentUser && authToken) {
+    refreshProgressFromCloudIfLoggedIn();
+  }
 
   if (searchInput.value.trim() === "") {
     if (scheduleContainer) scheduleContainer.classList.remove("hidden");
@@ -1586,9 +1764,9 @@ function renderSeasonal(animeList, trackerKey) {
       const badge = card.querySelector('.new-badge');
       if (badge) badge.remove();
 
-      // Load episode or search
+      // Load episode or search (pass null so loadEpisodes checks account watchHistory first!)
       if (anime._id) {
-          loadEpisodes(anime._id, title, 1, false, anime.image || "");
+          loadEpisodes(anime._id, title, null, false, anime.image || "", false);
       } else {
           searchInput.value = title;
           searchForm.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
@@ -1603,13 +1781,21 @@ function renderSeasonal(animeList, trackerKey) {
 function updateWatchHistory(showId, showName, epNum) {
   if (!showId || showId === "undefined" || showId === "null") return;
 
+  const normId = String(showId).trim().toLowerCase();
+  const normName = String(showName || showId).trim().toLowerCase();
+
   let history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
 
-  history = history.filter((item) => item.id !== showId);
+  history = history.filter((item) => {
+    if (!item) return false;
+    const iId = String(item.id || "").trim().toLowerCase();
+    const iName = String(item.name || "").trim().toLowerCase();
+    return iId !== normId && iId !== normName && iName !== normName && iName !== normId;
+  });
 
   history.unshift({
     id: showId,
-    name: showName,
+    name: showName || showId,
     ep: epNum,
   });
 
@@ -1705,14 +1891,7 @@ function renderContinueWatching() {
     }
 
     card.addEventListener("click", () => {
-      if (isRoomSyncActive()) {
-        socket.emit("load_show_action", {
-          showId: showKey,
-          showName: item.name,
-          targetEpNum: item.ep,
-        });
-      }
-      loadEpisodes(showKey, item.name, item.ep);
+      loadEpisodes(showKey, item.name, item.ep, false, "", false);
     });
 
     cwControls.appendChild(card);
@@ -1755,20 +1934,23 @@ videoPlayer.addEventListener("timeupdate", () => {
 
   timeDisplay.textContent = `${formatTime(currentTime)} / ${formatTime(videoPlayer.duration)}`;
 
-  if (currentShowId && currentEpNum && currentTime > 0) {
-    const saveKey = `save_${currentShowId}_${currentEpNum}`;
+  // Only record & upload progress AFTER initial saved-time seek has completed
+  if (!isInitialSeekPending && !isCheckingUnpauseConflict && currentShowId && currentEpNum && currentTime > 0) {
     if (
       videoPlayer.ended ||
       (videoPlayer.duration && videoPlayer.duration - currentTime <= 5)
     ) {
-      localStorage.removeItem(saveKey);
-      syncAccountProgressDelta({ deletedEpisodeTimes: [saveKey] });
+      removeSavedEpisodeTime(currentShowId, currentShowName, currentEpNum);
     } else {
+      const saveKey = `save_${currentShowId}_${currentEpNum}`;
       localStorage.setItem(saveKey, currentTime);
+      if (currentShowName && currentShowName !== currentShowId) {
+        localStorage.setItem(`save_${currentShowName}_${currentEpNum}`, currentTime);
+      }
       const nowMs = Date.now();
-      if (nowMs - lastEpisodeTimeSyncAt > 4000) {
+      if (!videoPlayer.paused && nowMs - lastEpisodeTimeSyncAt >= PROGRESS_UPLOAD_INTERVAL_MS) {
         lastEpisodeTimeSyncAt = nowMs;
-        flushEpisodeTimeToAccount(currentShowId, currentEpNum, currentTime);
+        flushEpisodeTimeToAccount(currentShowId, currentShowName, currentEpNum, currentTime);
       }
     }
   }
@@ -1939,14 +2121,7 @@ function renderLibraryGrid() {
         targetEp = dubCached[0];
         localStorage.setItem(`langPref_${id}`, "dub");
       }
-      const history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
-      const savedShow = history.find(
-        (item) => item.name === title || item.id === id,
-      );
-      if (savedShow && savedShow.ep) {
-        targetEp = savedShow.ep;
-      }
-      loadEpisodes(id, title, targetEp, false, anime.image || "");
+      loadEpisodes(id, title, targetEp, false, anime.image || "", false);
     });
 
     libraryGrid.appendChild(card);
@@ -2896,26 +3071,415 @@ function updateProfileStatsUI(progress) {
   profileProgressStats.textContent = `${hCount} show${hCount === 1 ? "" : "s"} in Continue Watching • ${eCount} saved episode timestamp${eCount === 1 ? "" : "s"}`;
 }
 
-async function syncAccountProgressDelta(deltaPayload, mode = "update") {
+async function syncAccountProgressDelta(
+  deltaPayload,
+  mode = "update",
+  useKeepalive = false,
+) {
   if (!currentUser || !authToken) return;
   try {
     await fetch("/api/account/progress", {
       method: "POST",
       headers: getAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ mode, ...deltaPayload }),
+      keepalive: useKeepalive,
     });
   } catch (err) {
     console.warn("Could not sync progress to account:", err);
   }
 }
 
-function flushEpisodeTimeToAccount(showId, epNum, currentTime) {
-  if (!currentUser || !showId || !epNum) return;
-  const saveKey = `save_${showId}_${epNum}`;
-  syncAccountProgressDelta({
-    episodeTimes: { [saveKey]: Math.round(currentTime * 100) / 100 },
+function flushEpisodeTimeToAccount(
+  showId,
+  showNameOrEp,
+  epNumOrTime,
+  maybeTime = null,
+  useKeepalive = false,
+) {
+  if (!currentUser || !showId) return;
+  let showName = "";
+  let epNum = showNameOrEp;
+  let currentTime = epNumOrTime;
+  if (maybeTime !== null && maybeTime !== undefined) {
+    showName = String(showNameOrEp || "");
+    epNum = epNumOrTime;
+    currentTime = maybeTime;
+  }
+  if (!epNum || !(Number(currentTime) > 0)) return;
+  const rounded = Math.round(Number(currentTime) * 100) / 100;
+  const timesMap = {
+    [`save_${showId}_${epNum}`]: rounded,
+  };
+  if (showName && showName !== showId) {
+    timesMap[`save_${showName}_${epNum}`] = rounded;
+  }
+  syncAccountProgressDelta({ episodeTimes: timesMap }, "update", useKeepalive);
+}
+
+function findSavedHistoryForShow(showId, showName, historyList = null) {
+  let history = historyList;
+  if (!Array.isArray(history)) {
+    try {
+      history = JSON.parse(localStorage.getItem("watchHistory") || "[]");
+    } catch (e) {
+      history = [];
+    }
+  }
+  if (!Array.isArray(history)) return null;
+  const normId = String(showId || "").trim().toLowerCase();
+  const normName = String(showName || showId || "").trim().toLowerCase();
+  return (
+    history.find((item) => {
+      if (!item) return false;
+      const iId = String(item.id || "").trim().toLowerCase();
+      const iName = String(item.name || "").trim().toLowerCase();
+      return (
+        (normId && (iId === normId || iName === normId)) ||
+        (normName && (iId === normName || iName === normName))
+      );
+    }) || null
+  );
+}
+
+function getSavedEpisodeTime(showId, showName, epNum, episodeTimesMap = null) {
+  if (!epNum) return 0;
+  const epStr = String(epNum).trim();
+  const candidates = [];
+  if (showId) candidates.push(`save_${showId}_${epStr}`);
+  if (showName && showName !== showId) candidates.push(`save_${showName}_${epStr}`);
+
+  if (episodeTimesMap && typeof episodeTimesMap === "object") {
+    for (const k of candidates) {
+      const val = parseFloat(episodeTimesMap[k]);
+      if (!isNaN(val) && val > 0) return val;
+    }
+    const lowerCandidates = candidates.map((c) => c.toLowerCase());
+    for (const [k, v] of Object.entries(episodeTimesMap)) {
+      if (lowerCandidates.includes(k.toLowerCase())) {
+        const val = parseFloat(v);
+        if (!isNaN(val) && val > 0) return val;
+      }
+    }
+    return 0;
+  }
+
+  for (const k of candidates) {
+    const raw = localStorage.getItem(k);
+    if (raw !== null) {
+      const val = parseFloat(raw);
+      if (!isNaN(val) && val > 0) return val;
+    }
+  }
+  return 0;
+}
+
+function removeSavedEpisodeTime(showId, showName, epNum) {
+  if (!epNum) return;
+  const epStr = String(epNum).trim();
+  const deleted = [];
+  if (showId) {
+    const k1 = `save_${showId}_${epStr}`;
+    localStorage.removeItem(k1);
+    deleted.push(k1);
+  }
+  if (showName && showName !== showId) {
+    const k2 = `save_${showName}_${epStr}`;
+    localStorage.removeItem(k2);
+    deleted.push(k2);
+  }
+  if (deleted.length > 0) {
+    syncAccountProgressDelta({ deletedEpisodeTimes: deleted });
+  }
+}
+
+async function fetchCloudProgressSnapshot() {
+  if (!currentUser || !authToken) return null;
+  try {
+    const res = await fetch("/api/account/progress", {
+      headers: getAuthHeaders(),
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.progress || null;
+  } catch (err) {
+    console.warn("Failed to fetch cloud progress snapshot:", err);
+    return null;
+  }
+}
+
+async function refreshProgressFromCloudIfLoggedIn() {
+  if (!currentUser || !authToken) return null;
+  const cloudProg = await fetchCloudProgressSnapshot();
+  if (cloudProg) {
+    applyAccountProgressToLocalStorage(cloudProg, currentUser.username);
+  }
+  return cloudProg;
+}
+
+// --- Unpause Cloud Conflict Detection (> 30s Pause Cooldown & > 10s Diff Threshold) ---
+const conflictModalBackdrop = document.getElementById(
+  "progress-conflict-modal-backdrop",
+);
+const conflictLocalDetailsEl = document.getElementById("conflict-local-details");
+const conflictCloudDetailsEl = document.getElementById("conflict-cloud-details");
+const conflictUseLocalBtn = document.getElementById("conflict-use-local-btn");
+const conflictUseCloudBtn = document.getElementById("conflict-use-cloud-btn");
+
+let pendingConflictResolution = null;
+
+function openProgressConflictModal({
+  localEp,
+  localTime,
+  cloudEp,
+  cloudTime,
+  cloudProgress,
+}) {
+  if (!conflictModalBackdrop) return;
+  pendingConflictResolution = {
+    localEp: String(localEp),
+    localTime: Number(localTime) || 0,
+    cloudEp: String(cloudEp),
+    cloudTime: Number(cloudTime) || 0,
+    cloudProgress,
+  };
+  if (conflictLocalDetailsEl) {
+    conflictLocalDetailsEl.textContent = `Episode ${localEp} • ${formatTime(localTime)}`;
+  }
+  if (conflictCloudDetailsEl) {
+    conflictCloudDetailsEl.textContent = `Episode ${cloudEp} • ${formatTime(cloudTime)}`;
+  }
+  conflictModalBackdrop.classList.remove("hidden");
+}
+
+function closeProgressConflictModal() {
+  if (conflictModalBackdrop) conflictModalBackdrop.classList.add("hidden");
+  pendingConflictResolution = null;
+}
+
+if (conflictUseLocalBtn) {
+  conflictUseLocalBtn.addEventListener("click", () => {
+    const info = pendingConflictResolution;
+    closeProgressConflictModal();
+    if (!info) return;
+
+    // Save local state to cloud so cloud matches this device
+    if (currentShowId && currentEpNum) {
+      updateWatchHistory(currentShowId, currentShowName, info.localEp);
+      flushEpisodeTimeToAccount(
+        currentShowId,
+        currentShowName,
+        info.localEp,
+        info.localTime,
+      );
+    }
+    lastUserPausedAt = 0;
+    isBypassingUnpauseConflictCheck = true;
+    videoPlayer
+      .play()
+      .then(() => {
+        isBypassingUnpauseConflictCheck = false;
+        videoOverlay.classList.add("hidden");
+      })
+      .catch(() => {
+        isBypassingUnpauseConflictCheck = false;
+      });
   });
 }
+
+if (conflictUseCloudBtn) {
+  conflictUseCloudBtn.addEventListener("click", async () => {
+    const info = pendingConflictResolution;
+    closeProgressConflictModal();
+    if (!info) return;
+
+    if (info.cloudProgress && currentUser) {
+      applyAccountProgressToLocalStorage(info.cloudProgress, currentUser.username);
+    }
+
+    lastUserPausedAt = 0;
+
+    // If the other device was on a different episode, switch to that episode (which will seek to cloudTime)
+    if (String(info.cloudEp) !== String(currentEpNum)) {
+      document.querySelectorAll("#episode-grid .ep-btn").forEach((b) => {
+        b.classList.remove("active");
+        if (b.dataset.ep == info.cloudEp || b.textContent == info.cloudEp) {
+          b.classList.add("active");
+        }
+      });
+      await playVideo(info.cloudEp, false, true);
+      return;
+    }
+
+    // Same episode: seek to cloudTime and play
+    videoPlayer.currentTime = info.cloudTime;
+    if (currentShowId && currentEpNum) {
+      localStorage.setItem(`save_${currentShowId}_${currentEpNum}`, info.cloudTime);
+    }
+    isBypassingUnpauseConflictCheck = true;
+    videoPlayer
+      .play()
+      .then(() => {
+        isBypassingUnpauseConflictCheck = false;
+        videoOverlay.classList.add("hidden");
+      })
+      .catch(() => {
+        isBypassingUnpauseConflictCheck = false;
+      });
+  });
+}
+
+async function handleUserUnpauseRequest() {
+  if (isCheckingUnpauseConflict) return;
+
+  const pauseElapsedMs = lastUserPausedAt > 0 ? Date.now() - lastUserPausedAt : 0;
+  const shouldCheckCloud =
+    Boolean(currentUser && authToken) &&
+    !isRoomSyncActive() &&
+    !isInitialSeekPending &&
+    Boolean(currentShowId && currentEpNum) &&
+    pauseElapsedMs >= UNPAUSE_CLOUD_CHECK_COOLDOWN_MS;
+
+  if (!shouldCheckCloud) {
+    lastUserPausedAt = 0;
+    isBypassingUnpauseConflictCheck = true;
+    videoPlayer
+      .play()
+      .then(() => {
+        isBypassingUnpauseConflictCheck = false;
+        videoOverlay.classList.add("hidden");
+      })
+      .catch(() => {
+        isBypassingUnpauseConflictCheck = false;
+      });
+    return;
+  }
+
+  // More than 30 seconds have passed since pause -> check cloud state before playing
+  isCheckingUnpauseConflict = true;
+  const localEp = String(currentEpNum);
+  const localTime = Number(videoPlayer.currentTime) || 0;
+
+  try {
+    const cloudProg = await fetchCloudProgressSnapshot();
+    if (cloudProg) {
+      const cloudSameEpTime = getSavedEpisodeTime(
+        currentShowId,
+        currentShowName,
+        localEp,
+        cloudProg.episodeTimes,
+      );
+      const cloudHistEntry = findSavedHistoryForShow(
+        currentShowId,
+        currentShowName,
+        cloudProg.watchHistory,
+      );
+      const cloudHistEp =
+        cloudHistEntry && cloudHistEntry.ep ? String(cloudHistEntry.ep) : localEp;
+      const cloudHistEpTime = getSavedEpisodeTime(
+        currentShowId,
+        currentShowName,
+        cloudHistEp,
+        cloudProg.episodeTimes,
+      );
+
+      // Check 1: Same episode with > 10s difference
+      if (
+        cloudSameEpTime > 0 &&
+        Math.abs(cloudSameEpTime - localTime) > CLOUD_TIME_DIFF_THRESHOLD_SEC
+      ) {
+        isCheckingUnpauseConflict = false;
+        openProgressConflictModal({
+          localEp,
+          localTime,
+          cloudEp: localEp,
+          cloudTime: cloudSameEpTime,
+          cloudProgress: cloudProg,
+        });
+        return;
+      }
+
+      // Check 2: Different episode in cloud watchHistory with saved progress
+      if (cloudHistEp !== localEp && cloudHistEpTime > 0) {
+        isCheckingUnpauseConflict = false;
+        openProgressConflictModal({
+          localEp,
+          localTime,
+          cloudEp: cloudHistEp,
+          cloudTime: cloudHistEpTime,
+          cloudProgress: cloudProg,
+        });
+        return;
+      }
+    }
+  } catch (err) {
+    console.warn("Unpause cloud check error:", err);
+  }
+
+  isCheckingUnpauseConflict = false;
+  lastUserPausedAt = 0;
+  isBypassingUnpauseConflictCheck = true;
+  videoPlayer
+    .play()
+    .then(() => {
+      isBypassingUnpauseConflictCheck = false;
+      videoOverlay.classList.add("hidden");
+    })
+    .catch(() => {
+      isBypassingUnpauseConflictCheck = false;
+    });
+}
+
+// Flush current playback position when locking phone screen, switching tabs, or closing page
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState === "hidden") {
+    if (
+      currentShowId &&
+      currentEpNum &&
+      !isInitialSeekPending &&
+      videoPlayer.currentTime > 0 &&
+      !videoPlayer.ended
+    ) {
+      const saveKey = `save_${currentShowId}_${currentEpNum}`;
+      localStorage.setItem(saveKey, videoPlayer.currentTime);
+      flushEpisodeTimeToAccount(
+        currentShowId,
+        currentShowName,
+        currentEpNum,
+        videoPlayer.currentTime,
+        true,
+      );
+    }
+    if (videoPlayer.paused && !lastUserPausedAt) {
+      lastUserPausedAt = Date.now();
+    }
+  } else if (document.visibilityState === "visible") {
+    // If on the home screen when returning to this device, refresh Continue Watching from cloud
+    if (watchView.classList.contains("hidden") && currentUser && authToken) {
+      await refreshProgressFromCloudIfLoggedIn();
+    }
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  if (
+    currentShowId &&
+    currentEpNum &&
+    !isInitialSeekPending &&
+    videoPlayer.currentTime > 0 &&
+    !videoPlayer.ended
+  ) {
+    const saveKey = `save_${currentShowId}_${currentEpNum}`;
+    localStorage.setItem(saveKey, videoPlayer.currentTime);
+    flushEpisodeTimeToAccount(
+      currentShowId,
+      currentShowName,
+      currentEpNum,
+      videoPlayer.currentTime,
+      true,
+    );
+  }
+});
 
 function updateAuthUI() {
   if (currentUser) {
