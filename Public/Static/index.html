@@ -726,7 +726,7 @@
 
         <!-- ACCOUNT / AUTHENTICATION MODAL -->
         <div id="auth-modal-backdrop" class="modal-backdrop hidden">
-            <div class="download-modal" style="max-width: 480px;" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+            <div class="download-modal account-modal" style="max-width: 460px;" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
                 <div class="modal-header">
                     <div>
                         <h3 id="auth-modal-title">👤 Account &amp; Progress Sync</h3>
@@ -773,7 +773,7 @@
                         <div class="auth-migration-note">
                             ✨ Any progress currently saved in this browser's local storage will be automatically imported to your account when you sign in or register!
                         </div>
-                        <button type="submit" id="auth-submit-btn" style="width: 100%;">
+                        <button type="submit" id="auth-submit-btn" class="account-action-btn primary-account-btn">
                             Sign In &amp; Sync Progress
                         </button>
                     </form>
@@ -783,22 +783,22 @@
                 <div id="auth-profile-section" class="modal-body hidden">
                     <div class="profile-summary-card">
                         <div class="profile-avatar">👤</div>
-                        <div style="flex: 1;">
-                            <div style="display: flex; align-items: center; gap: 0.5rem;">
-                                <h4 id="profile-username-display" style="font-size: 1.15rem;">Username</h4>
+                        <div class="profile-summary-info">
+                            <div class="profile-summary-title-row">
+                                <h4 id="profile-username-display">Username</h4>
                                 <span id="profile-role-badge" class="cached-badge">MEMBER</span>
                             </div>
-                            <p id="profile-progress-stats" style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem;">
+                            <p id="profile-progress-stats">
                                 0 shows in history • 0 episode positions saved
                             </p>
                         </div>
                     </div>
 
                     <div class="profile-actions-stack">
-                        <button type="button" id="profile-sync-now-btn" class="secondary-btn" style="width: 100%;">
-                            ☁️ Sync &amp; Merge Browser Local Storage Now
+                        <button type="button" id="profile-sync-now-btn" class="secondary-btn account-action-btn">
+                            ☁️ Sync &amp; Merge Browser Local Storage
                         </button>
-                        <button type="button" id="profile-open-admin-btn" class="secondary-btn hidden" style="width: 100%; border-color: var(--primary); color: #a5b4fc;">
+                        <button type="button" id="profile-open-admin-btn" class="secondary-btn account-action-btn hidden" style="border-color: var(--primary); color: #a5b4fc;">
                             🛡️ Open Admin Dashboard
                         </button>
                     </div>
@@ -806,8 +806,8 @@
                     <hr class="admin-divider" />
 
                     <form id="change-password-form" class="auth-form">
-                        <h4 style="font-size: 0.92rem; color: var(--text-muted);">🔑 Change Password</h4>
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                        <h4 style="font-size: 0.9rem; color: var(--text-muted);">🔑 Change Password</h4>
+                        <div class="password-grid">
                             <input
                                 type="password"
                                 id="cp-current-pw"
@@ -821,11 +821,11 @@
                                 required
                             />
                         </div>
-                        <button type="submit" class="secondary-btn mini-btn">Update Password</button>
+                        <button type="submit" class="secondary-btn account-action-btn">Update Password</button>
                     </form>
 
-                    <div class="modal-footer" style="padding: 0.75rem 0 0; background: transparent;">
-                        <button type="button" id="auth-logout-btn" class="secondary-btn" style="color: #f87171; border-color: rgba(239, 68, 68, 0.4); width: 100%;">
+                    <div class="modal-footer account-modal-footer">
+                        <button type="button" id="auth-logout-btn" class="secondary-btn account-action-btn" style="color: #f87171; border-color: rgba(239, 68, 68, 0.4);">
                             🚪 Sign Out of Account
                         </button>
                     </div>
