@@ -2826,17 +2826,23 @@ def download_worker_loop():
 
 @app.route("/")
 def hello_world():
-    return send_file("Public/Static/index.html", mimetype="text/html")
+    resp = send_file("Public/Static/index.html", mimetype="text/html", max_age=0)
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 @app.route("/style")
 def style():
-    return send_file("Public/Static/style.css", mimetype="text/css")
+    resp = send_file("Public/Static/style.css", mimetype="text/css", max_age=0)
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 @app.route("/logic")
 def logic():
-    return send_file("Public/Static/logic.js", mimetype="text/javascript")
+    resp = send_file("Public/Static/logic.js", mimetype="text/javascript", max_age=0)
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 @app.route("/vendor/<path:filename>")
